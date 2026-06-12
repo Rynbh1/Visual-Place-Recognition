@@ -1,0 +1,78 @@
+La géolocalisation visuelle in-the-wild (VPR) a connu une transformation majeure en 2025-2026, passant de méthodes basées sur de simples descripteurs locaux à des architectures cognitives multimodales et décentralisées.  
+TXT
++ 1
+
+Voici une synthèse de l'état de l'art actuel pour réaliser une localisation précise sans aucune métadonnée (GPS/EXIF).  
+TXT
++ 1
+
+1. Fondations : Modèles Fondateurs et Espace Hyperbolique
+Le passage à des modèles de très grande échelle, comme ceux entraînés sur le jeu de données OpenStreetView-5M (OSV-5M), permet une compréhension holistique de la géographie mondiale plutôt qu'une simple mémorisation de lieux.  
+TXT
++ 1
+
+
+MegaLoc : Ce modèle unifie les tâches de recherche visuelle (urbain, monuments, 3D), surpassant les méthodes spécialisées antérieures grâce à un apprentissage par contraste avancé.  
+TXT
++ 1
+
+
+HypeVPR et Espace Hyperbolique : Pour résoudre le fossé entre les panoramas de référence (équirectangulaires) et les photos d'utilisateurs (perspectives), le modèle HypeVPR projette les données dans un espace hyperbolique. Cette géométrie permet une recherche hiérarchique "du grossier vers le fin", rendant l'inférence jusqu'à 5 fois plus rapide.  
+TXT
++ 3
+
+2. Stratégies Hybrides : L'apport de la Sémantique
+Pour contrer l'aliasing perceptuel (confusion entre deux lieux visuellement identiques), les systèmes modernes utilisent des contraintes symboliques.  
+TXT
+
+
+Extraction de texte (OCR/TextInPlace) : Le texte détecté est filtré par des LLM pour ne conserver que les entités à forte valeur géographique (ex: adresses, noms de rues uniques), permettant de lever les ambiguïtés structurelles.  
+TXT
++ 1
+
+
+Détection d'objets (YOLO26) : Utilisé pour masquer les éléments dynamiques (piétons, voitures) qui polluent les calculs de similarité, ou pour créer des graphes sémantiques basés sur la disposition relative des objets.  
+TXT
+
+3. Architecture "Edge AI" : Efficacité et Fusion Tardive
+Le déploiement local (sur smartphone ou robot) impose de traiter les données sans dépendre du cloud, pour des raisons de latence, de confidentialité et de souveraineté.  
+TXT
++ 1
+
+
+Fusion Tardive (Late Fusion) : Au lieu de mélanger les données dès le début, le système traite chaque modalité (image, texte, objets) comme un expert indépendant. La décision finale est prise via un vote pondéré adaptatif basé sur l'incertitude.  
+TXT
++ 2
+
+Pipeline Optimal (Résumé) :
+
+
+Prétraitement : Masquage des objets dynamiques avec YOLO26.  
+TXT
+
+
+Extraction Sémantique : Analyse OCR/VLM quantifié (ex: Gemma 4 12B).  
+TXT
+
+
+Récupération : Recherche d'embeddings dans FAISS.  
+TXT
+
+
+Validation : Application d'une régression logistique sur le nombre d'inliers RANSAC pour estimer la probabilité de succès (P 
+correct
+​
+ ), remplaçant le réordonnancement aveugle.  
+TXT
++ 1
+
+4. Validation : Le paradigme "To Match or Not to Match"
+La recherche a invalidé le dogme du réordonnancement systématique. Aujourd'hui, on préfère une vérification géométrique conditionnelle. Si le score de confiance initial (via MegaLoc/FAISS) est suffisamment haut et saillant par rapport aux autres candidats, le système valide la localisation sans recourir à des calculs lourds de RANSAC, économisant ainsi drastiquement l'énergie.  
+TXT
++ 3
+
+Les systèmes OOD (Out-of-Distribution) utilisent enfin des mesures de confiance sur la dispersion de la matrice de similarité pour "s'abstenir" et ne pas fournir de résultat erroné face à des images non géographiques.  
+TXT
++ 1
+
+Souhaitez-vous approfondir les détails techniques sur la quantification GGUF pour les modèles VLM locaux ou sur le calcul des poids dynamiques α dans le vote pondéré ?
