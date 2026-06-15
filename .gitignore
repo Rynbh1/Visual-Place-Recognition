@@ -4,3 +4,5 @@ datasets/
 paris_lists/_metadata/
 __pycache__/
 *.pyc
+*.pth
+*.png
