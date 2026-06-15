@@ -61,9 +61,295 @@ THUMB_FIELD = {
     "original": "thumb_original_url",
 }
 
+# ---------------------------------------------------------------------------
+# Supplement Panoramax / KartaView + carte de couverture
+# ---------------------------------------------------------------------------
+MIN_PHOTOS_PER_PLACE = 4
+PANORAMAX_SEARCH = "https://panoramax.ign.fr/api/search"
+KARTAVIEW_PHOTOS = "https://api.kartaview.org/2.0/photo/"
+
+# Template HTML Leaflet — les placeholders LAT_CTR/LON_CTR/GEOJSON/MIN_P sont
+# substitues par str.replace() pour eviter tout conflit avec les accolades JS.
+_COVERAGE_MAP_TMPL = """\
+<!DOCTYPE html><html><head>
+<meta charset="utf-8"><title>Couverture street-level</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>body{margin:0}#map{height:100vh}</style>
+</head><body><div id="map"></div><script>
+var map=L.map("map").setView([LAT_CTR,LON_CTR],15);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"&copy; OpenStreetMap"}).addTo(map);
+var gj=GEOJSON;
+L.geoJSON(gj,{
+  style:function(f){return{color:f.properties.color,weight:1,fillOpacity:0.55,fillColor:f.properties.color};},
+  onEachFeature:function(f,layer){layer.bindPopup(f.properties.popup);}
+}).addTo(map);
+var leg=L.control({position:"bottomright"});
+leg.onAdd=function(){
+  var d=L.DomUtil.create("div");
+  d.style.cssText="background:white;padding:8px;border-radius:4px;font-size:13px";
+  d.innerHTML="<b>Couverture</b><br>"
+    +"<span style='color:#2ecc71'>&#9632;</span> Mapillary &ge;MIN_P<br>"
+    +"<span style='color:#27ae60'>&#9632;</span> Complément &ge;MIN_P<br>"
+    +"<span style='color:#e67e22'>&#9632;</span> Insuffisant<br>"
+    +"<span style='color:#e74c3c'>&#9632;</span> Absent";
+  return d;
+};
+leg.addTo(map);
+</script></body></html>"""
+
+
+def _pano_bbox_scan(bbox, polygon, place_size):
+    """Scanne Panoramax IGN sur la bbox ; renvoie dict {cell -> [candidats]}."""
+    w, s, e, n = bbox
+    session = requests.Session()
+    by_cell = {}
+    url = PANORAMAX_SEARCH
+    params = {"bbox": f"{w},{s},{e},{n}", "limit": 500}
+    fetched = 0
+    while url:
+        try:
+            r = session.get(url, params=params, timeout=30)
+            params = {}
+            if r.status_code != 200:
+                break
+            data = r.json()
+        except Exception:
+            break
+        for feat in data.get("features", []):
+            coords = (feat.get("geometry") or {}).get("coordinates")
+            if not coords or len(coords) < 2:
+                continue
+            lon, lat = float(coords[0]), float(coords[1])
+            if polygon and not point_in_polygon(lon, lat, polygon):
+                continue
+            assets = feat.get("assets", {})
+            img_url = ""
+            for k in ("hd", "sd"):
+                v = assets.get(k) or {}
+                if v.get("href"):
+                    img_url = v["href"]
+                    break
+            if not img_url:
+                img_url = next(
+                    (lk.get("href", "") for lk in feat.get("links", [])
+                     if lk.get("rel") == "enclosure"), ""
+                )
+            if not img_url:
+                continue
+            cell = place_key(lon, lat, place_size)
+            by_cell.setdefault(cell, []).append({
+                "id": f"pano_{feat.get('id', '')}",
+                "url": img_url, "lon": lon, "lat": lat, "source": "panoramax",
+            })
+            fetched += 1
+        url = next(
+            (lk["href"] for lk in data.get("links", []) if lk.get("rel") == "next"),
+            None,
+        )
+    print(f"  Panoramax : {fetched} images ({len(by_cell)} cellules)")
+    return by_cell
+
+
+def _kv_bbox_scan(bbox, polygon, place_size):
+    """Scanne KartaView sur la bbox ; renvoie dict {cell -> [candidats]}."""
+    w, s, e, n = bbox
+    session = requests.Session()
+    by_cell = {}
+    page = 1
+    fetched = 0
+    while True:
+        try:
+            r = session.get(
+                KARTAVIEW_PHOTOS,
+                params={"bbBottomLeft": f"{s},{w}", "bbTopRight": f"{n},{e}",
+                        "page": page, "itemsPerPage": 500},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+        except Exception:
+            break
+        items = (data.get("result") or {}).get("data") or []
+        if not items:
+            break
+        for item in items:
+            try:
+                lat = float(item["lat"])
+                lon = float(item["lng"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if polygon and not point_in_polygon(lon, lat, polygon):
+                continue
+            url = (item.get("filePath") or item.get("largeThumbnailPath") or "").strip()
+            if not url:
+                continue
+            if url.startswith("/"):
+                url = "https://kartaview.org" + url
+            cell = place_key(lon, lat, place_size)
+            by_cell.setdefault(cell, []).append({
+                "id": f"kv_{item.get('id', '')}",
+                "url": url, "lon": lon, "lat": lat, "source": "kartaview",
+            })
+            fetched += 1
+        tot = (data.get("result") or {}).get("totalFilteredItems")
+        if isinstance(tot, list):
+            tot = tot[0] if tot else 0
+        tot = int(tot or 0)
+        if page * 500 >= tot or not tot:
+            break
+        page += 1
+    print(f"  KartaView : {fetched} images ({len(by_cell)} cellules)")
+    return by_cell
+
+
+def write_coverage_map(bbox, place_size, mly_by_cell, pano_by_cell, kv_by_cell, out_path):
+    """Genere coverage_map.html (Leaflet) : grille coloree par couverture."""
+    w, s, e, n = bbox
+    all_cells = set(mly_by_cell) | set(pano_by_cell) | set(kv_by_cell)
+    features = []
+    for cell in all_cells:
+        ix, iy = cell
+        dlat = place_size / 111_320
+        lat_c = iy * dlat
+        dlon = place_size / (111_320 * math.cos(math.radians(lat_c)) + 1e-9)
+        lon_c = ix * dlon
+        lon0, lon1 = lon_c - dlon / 2, lon_c + dlon / 2
+        lat0, lat1 = lat_c - dlat / 2, lat_c + dlat / 2
+        n_mly  = len(mly_by_cell.get(cell, []))
+        n_pano = len(pano_by_cell.get(cell, []))
+        n_kv   = len(kv_by_cell.get(cell, []))
+        total  = n_mly + n_pano + n_kv
+        if n_mly >= MIN_PHOTOS_PER_PLACE:
+            color = "#2ecc71"
+        elif total >= MIN_PHOTOS_PER_PLACE:
+            color = "#27ae60"
+        elif total > 0:
+            color = "#e67e22"
+        else:
+            color = "#e74c3c"
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[lon0, lat0], [lon1, lat0],
+                                  [lon1, lat1], [lon0, lat1], [lon0, lat0]]]
+            },
+            "properties": {
+                "n_mly": n_mly, "n_pano": n_pano, "n_kv": n_kv, "total": total,
+                "color": color,
+                "popup": (f"Mapillary:{n_mly} | Panoramax:{n_pano} | "
+                          f"KartaView:{n_kv} | Total:{total}"),
+            }
+        })
+    geojson = json.dumps(
+        {"type": "FeatureCollection", "features": features}, ensure_ascii=False
+    )
+    lat_ctr = (s + n) / 2
+    lon_ctr = (w + e) / 2
+    html = (
+        _COVERAGE_MAP_TMPL
+        .replace("LAT_CTR", f"{lat_ctr:.5f}")
+        .replace("LON_CTR", f"{lon_ctr:.5f}")
+        .replace("GEOJSON", geojson)
+        .replace("MIN_P", str(MIN_PHOTOS_PER_PLACE))
+    )
+    out_path.write_text(html, encoding="utf-8")
+    print(f"  Carte couverture -> {out_path}")
+
+
+def _build_supplement(pano_by_cell, kv_by_cell, place_cell_map, max_per_place=None):
+    """Construit {place_id -> [candidats]} pour le champ 'supplement' du plan."""
+    limit = max_per_place or MIN_PHOTOS_PER_PLACE
+    supp = {}
+    for pid, cell in place_cell_map.items():
+        cands = []
+        for src in (pano_by_cell.get(cell, []), kv_by_cell.get(cell, [])):
+            for c in src:
+                if len(cands) >= limit:
+                    break
+                cands.append(c)
+            if len(cands) >= limit:
+                break
+        if cands:
+            supp[pid] = cands
+    return supp
+
+
+def _dl_supplement(session, url, dest):
+    """Telecharge une image de complement ; renvoie True si OK."""
+    for attempt in range(3):
+        try:
+            r = session.get(url, timeout=60)
+            r.raise_for_status()
+            content = r.content
+            Image.open(BytesIO(content)).convert("RGB")
+            dest.write_bytes(content)
+            return True
+        except Exception:
+            time.sleep(2 ** attempt)
+    return False
+
+
+def topup_places(out_dir, supplement, manifest_path, min_photos=MIN_PHOTOS_PER_PLACE):
+    """Apres le DL Mapillary, complete les lieux avec < min_photos images
+    depuis Panoramax / KartaView en utilisant les candidats preselectionnes."""
+    if not supplement:
+        return 0
+    rows = [json.loads(l)
+            for l in manifest_path.read_text().splitlines() if l.strip()]
+    count_by = {}
+    for r in rows:
+        count_by[r["place"]] = count_by.get(r["place"], 0) + 1
+    to_fill = {pid: cands for pid, cands in supplement.items()
+               if count_by.get(pid, 0) < min_photos}
+    if not to_fill:
+        return 0
+    print(f"\n  Complement Panoramax/KartaView : "
+          f"{len(to_fill)} lieu(x) < {min_photos} photos")
+    session = requests.Session()
+    new_rows, total = [], 0
+    for place_id, candidates in to_fill.items():
+        need = min_photos - count_by.get(place_id, 0)
+        place_dir = out_dir / "places" / place_id
+        place_dir.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for cand in candidates:
+            if added >= need:
+                break
+            safe = re.sub(r"[^A-Za-z0-9]", "", str(cand["id"]))[:40]
+            fname = f"supp_{cand['source']}_{safe}.jpg"
+            dest = place_dir / fname
+            if dest.exists() or _dl_supplement(session, cand["url"], dest):
+                rel = f"places/{place_id}/{fname}"
+                new_rows.append({
+                    "id": cand["id"], "place": place_id, "file": rel,
+                    "lon": cand.get("lon"), "lat": cand.get("lat"),
+                    "source": cand["source"],
+                })
+                added += 1
+        if added:
+            print(f"    {place_id} : +{added}")
+        total += added
+    if new_rows:
+        with manifest_path.open("a", encoding="utf-8") as mf:
+            for r in new_rows:
+                mf.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if total:
+        print(f"  Total complement : {total} images ajoutees.")
+    return total
+
 
 def get_token() -> str:
     tok = os.environ.get("MAPILLARY_TOKEN", "").strip()
+    if not tok:
+        # repli sur secrets_local.py (git-ignore) si disponible
+        try:
+            import secrets_local
+            tok = getattr(secrets_local, "MAPILLARY_TOKEN", "").strip()
+        except ImportError:
+            tok = ""
     if not tok:
         print(
             "ERREUR : variable d'environnement MAPILLARY_TOKEN absente.\n"
@@ -255,7 +541,7 @@ def cmd_estimate(args):
     out_dir = Path(args.outdir) / slug(args.city, args.postal)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[1/2] Geocodage...")
+    print("\n[1/3] Geocodage...")
     bbox, polygon = geocode(args.city, args.postal)
     area = bbox_area_km2(bbox)
     print(f"  Surface (bbox) ~ {area:.2f} km2")
@@ -275,7 +561,7 @@ def cmd_estimate(args):
     }
 
     if args.method == "pano-crop":
-        print("\n[2/2] Recherche des panoramas + planification des crops...")
+        print("\n[2/3] Recherche des panoramas + planification des crops...")
         min_views = args.min_views if args.min_views is not None else args.views
         tasks, kept, dropped, hist = scan_pano_crops(
             bbox, polygon, token, args.place_size, args.views, min_views,
@@ -285,6 +571,12 @@ def cmd_estimate(args):
         n_places = kept
         size_mb = n * AVG_CROP_MB
         est_time = n / max(1, args.workers * 0.5)
+        # Supplement : cellules associees a chaque place_id (pour topup)
+        place_cell_map = {}
+        for t in tasks:
+            pid = t["place_id"]
+            cell = place_key(t["pano_lon"], t["pano_lat"], args.place_size)
+            place_cell_map[pid] = cell
         plan.update(
             {
                 "fov": args.fov,
@@ -308,8 +600,13 @@ def cmd_estimate(args):
             f"    -> {kept} carres gardes (>= {min_views} panos), "
             f"{dropped} abandonnes"
         )
+        # index Mapillary by cell pour la coverage map
+        mly_by_cell = {}
+        for t in tasks:
+            cell = place_key(t["pano_lon"], t["pano_lat"], args.place_size)
+            mly_by_cell.setdefault(cell, []).append(t)
     elif args.method == "both":
-        print("\n[2/2] Panoramas (vers le centre) + perspectives par lieu...")
+        print("\n[2/3] Panoramas (vers le centre) + perspectives par lieu...")
         tasks, n_places, n_pano, n_flat = scan_both(
             bbox, polygon, token, args.place_size, args.views, args.min_dist,
             args.max_images,
@@ -317,6 +614,12 @@ def cmd_estimate(args):
         n = len(tasks)
         size_mb = n_pano * AVG_CROP_MB + n_flat * AVG_MB[args.resolution]
         est_time = n / max(1, args.workers * 0.6)
+        place_cell_map = {}
+        for t in tasks:
+            pid = t["place_id"]
+            lon = t.get("pano_lon") or t.get("lon", 0)
+            lat = t.get("pano_lat") or t.get("lat", 0)
+            place_cell_map[pid] = place_key(lon, lat, args.place_size)
         plan.update(
             {
                 "fov": args.fov,
@@ -334,17 +637,30 @@ def cmd_estimate(args):
         )
         print(f"\n  {n_pano} crops panoramiques + {n_flat} perspectives "
               f"sur {n_places} lieux")
-    else:
-        print("\n[2/2] Balayage de la couverture Mapillary...")
+        mly_by_cell = {}
+        for t in tasks:
+            lon = t.get("pano_lon") or t.get("lon", 0)
+            lat = t.get("pano_lat") or t.get("lat", 0)
+            cell = place_key(lon, lat, args.place_size)
+            mly_by_cell.setdefault(cell, []).append(t)
+    else:  # shared
+        print("\n[2/3] Balayage de la couverture Mapillary...")
         images = scan_coverage(
             bbox, polygon, token, args.image_type, args.min_dist, args.max_images
         )
         n = len(images)
-        n_places = len(
-            {place_key(im["lon"], im["lat"], args.place_size) for im in images}
-        )
+        # groupe par cellule pour la coverage map et le supplement
+        mly_by_cell = {}
+        for im in images:
+            cell = place_key(im["lon"], im["lat"], args.place_size)
+            mly_by_cell.setdefault(cell, []).append(im)
+        n_places = len(mly_by_cell)
         size_mb = n * AVG_MB[args.resolution]
         est_time = n / max(1, args.workers * 0.7)
+        # place_cell_map pour le supplement : place_NNNNNN -> cellule
+        place_cell_map = {}
+        for pidx, cell in enumerate(sorted(mly_by_cell)):
+            place_cell_map[f"place_{pidx:06d}"] = cell
         plan.update(
             {
                 "count": n,
@@ -355,6 +671,27 @@ def cmd_estimate(args):
                 "images": images,
             }
         )
+
+    # -----------------------------------------------------------------
+    # [3/3] Scan Panoramax + KartaView -> supplement + coverage map
+    # -----------------------------------------------------------------
+    print("\n[3/3] Scan Panoramax + KartaView (complement de couverture)...")
+    pano_by_cell = _pano_bbox_scan(bbox, polygon, args.place_size)
+    kv_by_cell   = _kv_bbox_scan(bbox, polygon, args.place_size)
+
+    supplement = _build_supplement(pano_by_cell, kv_by_cell, place_cell_map)
+    plan["supplement"] = supplement
+
+    map_path = out_dir / "coverage_map.html"
+    write_coverage_map(bbox, args.place_size, mly_by_cell, pano_by_cell,
+                       kv_by_cell, map_path)
+
+    # compter les cellules sans aucune couverture dans la bbox
+    all_covered = set(mly_by_cell) | set(pano_by_cell) | set(kv_by_cell)
+    needs_topup = sum(
+        1 for pid, cell in place_cell_map.items()
+        if len(mly_by_cell.get(cell, [])) < MIN_PHOTOS_PER_PLACE
+    )
 
     plan_path = out_dir / "dataset_plan.json"
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
@@ -380,7 +717,14 @@ def cmd_estimate(args):
     print(f"  Resolution source       : {args.resolution} px")
     print(f"  Taille estimee          : {size_mb / 1024:.2f} Go ({size_mb:.0f} Mo)")
     print(f"  Duree estimee (x{args.workers})  : {human_time(est_time)}")
+    print(f"  Panoramax               : {sum(len(v) for v in pano_by_cell.values())} images "
+          f"({len(pano_by_cell)} cellules)")
+    print(f"  KartaView               : {sum(len(v) for v in kv_by_cell.values())} images "
+          f"({len(kv_by_cell)} cellules)")
+    print(f"  Lieux a completer       : {needs_topup} < {MIN_PHOTOS_PER_PLACE} photos "
+          f"(seront completes par Panoramax/KartaView au download)")
     print(f"  Plan ecrit              : {plan_path}")
+    print(f"  Carte couverture        : {map_path}")
     print("=" * 60)
     print("\n  Pour lancer le telechargement :")
     print(f"    python {Path(sys.argv[0]).name} download --plan {plan_path}")
@@ -953,9 +1297,22 @@ def cmd_download(args):
     token = get_token()
     plan = json.loads(Path(args.plan).read_text())
     if plan.get("method") == "pano-crop":
-        return download_pano_crops(plan, token, args.assume_north_aligned)
+        rc = download_pano_crops(plan, token, args.assume_north_aligned)
+        # Topup apres pano-crop si le supplement est present dans le plan
+        supplement = plan.get("supplement", {})
+        if supplement:
+            manifest_path = Path(plan["out_dir"]) / "manifest.jsonl"
+            if manifest_path.exists():
+                topup_places(Path(plan["out_dir"]), supplement, manifest_path)
+        return rc
     if plan.get("method") == "both":
-        return download_both(plan, token, args)
+        rc = download_both(plan, token, args)
+        supplement = plan.get("supplement", {})
+        if supplement:
+            manifest_path = Path(plan["out_dir"]) / "manifest.jsonl"
+            if manifest_path.exists():
+                topup_places(Path(plan["out_dir"]), supplement, manifest_path)
+        return rc
 
     out_dir = Path(plan["out_dir"])
     resolution = plan["resolution"]
@@ -978,6 +1335,10 @@ def cmd_download(args):
     )
     if not todo:
         print("  Rien a faire.")
+        # Topup quand meme (plan peut avoir des lieux insuffisants apres reprise)
+        supplement = plan.get("supplement", {})
+        if supplement and manifest_path.exists():
+            topup_places(out_dir, supplement, manifest_path)
         return 0
 
     try:
@@ -1011,6 +1372,11 @@ def cmd_download(args):
                 mf.flush()
                 ok += 1
 
+    # Complement Panoramax/KartaView pour les lieux < MIN_PHOTOS_PER_PLACE
+    supplement = plan.get("supplement", {})
+    if supplement:
+        topup_places(out_dir, supplement, manifest_path)
+
     # export CSV pratique en plus du jsonl
     rows = [json.loads(l) for l in manifest_path.read_text().splitlines() if l.strip()]
     if rows:
@@ -1021,7 +1387,7 @@ def cmd_download(args):
             wri.writerows(rows)
         n_places = len({r.get("place") for r in rows})
         filtered = len(todo) - ok
-        print(f"\n  {ok} nouvelles images gardees, {filtered} ecartees "
+        print(f"\n  {ok} nouvelles images Mapillary, {filtered} ecartees "
               f"(qualite/illisibles/echecs).")
         print(f"  CSV : {csv_path}  ({len(rows)} images, {n_places} lieux)")
         print(f"  Images : {out_dir / 'places'}/place_NNNNNN/img_<angle>.jpg")

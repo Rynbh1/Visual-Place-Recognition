@@ -1,1 +1,6 @@
-./venv
+venv/
+secrets_local.py
+datasets/
+paris_lists/_metadata/
+__pycache__/
+*.pyc
