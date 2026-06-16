@@ -10,9 +10,8 @@ from PIL import Image
 from tqdm import tqdm
 
 # Ajouter MegaLoc-main au path pour pouvoir importer ses modules locaux
-sys.path.append("./MegaLoc-main")
-from repo.hubconf import get_trained_model
-from loss import MultiSimilarityLoss
+from lib.hubconf import get_trained_model
+from lib.loss import MultiSimilarityLoss
 # ---------------------------------------------------------------------------
 # 2. Dataset au format GSV-Cities
 # ---------------------------------------------------------------------------
@@ -61,6 +60,21 @@ class GSVCitiesFineTuneDataset(Dataset):
 # 3. Pipeline d'entraînement
 # ---------------------------------------------------------------------------
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MegaLoc Fine-tuning Script")
+    parser.add_argument("--train_csv", type=str, 
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Dataframes/Paris75019_train.csv",
+                        help="Path to the training CSV file")
+    parser.add_argument("--img_dir", type=str, 
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Images",
+                        help="Path to the images directory")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--save_weights", type=str, default="megaloc_finetuned_paris.pth",
+                        help="Output filename for fine-tuned weights")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
 
@@ -72,15 +86,15 @@ def main():
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    train_csv = "datasets/paris_75018_gsv/Dataframes/Paris75018_train.csv"
-    img_dir = "datasets/paris_75018_gsv/Images"
+    train_csv = args.train_csv
+    img_dir = args.img_dir
     
     if not os.path.exists(train_csv):
         print(f"Erreur : Exporter d'abord le dataset avec mapillary_dataset.py export")
         return
 
     dataset = GSVCitiesFineTuneDataset(train_csv, img_dir, transform=train_transform)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=2, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, drop_last=True)
 
     print("Chargement de MegaLoc pré-entraîné...")
     model = get_trained_model().to(device)
@@ -107,13 +121,13 @@ def main():
     # Optimiseur AdamW sur les paramètres actifs
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=1e-5, # Taux d'apprentissage adapté au fine-tuning
+        lr=args.lr, # Taux d'apprentissage adapté au fine-tuning
         weight_decay=1e-3
     )
 
     criterion = MultiSimilarityLoss()
 
-    epochs = 5
+    epochs = args.epochs
     for epoch in range(epochs):
         epoch_loss = 0.0
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
@@ -141,8 +155,8 @@ def main():
         print(f"Perte moyenne Epoch {epoch+1} : {epoch_loss / len(dataloader):.4f}")
 
     # Sauvegarder
-    torch.save(model.state_dict(), "megaloc_finetuned_paris.pth")
-    print("Modèle fine-tuné sauvegardé avec succès sous 'megaloc_finetuned_paris.pth'")
+    torch.save(model.state_dict(), args.save_weights)
+    print(f"Modèle fine-tuné sauvegardé avec succès sous '{args.save_weights}'")
 
 if __name__ == "__main__":
     main()

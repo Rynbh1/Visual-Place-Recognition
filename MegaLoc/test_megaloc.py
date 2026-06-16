@@ -12,17 +12,29 @@ from tqdm import tqdm
 # Ajouter les sous-dossiers locaux au path de recherche de modules
 sys.path.append("./MegaLoc")
 sys.path.append("./MegaLoc/repo")
-from repo.megaloc_model import MegaLoc
+from lib.megaloc_model import MegaLoc
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MegaLoc Testing Script")
+    parser.add_argument("--weights_path", type=str, default="megaloc_finetuned_paris.pth",
+                        help="Path to the model weights file")
+    parser.add_argument("--test_csv", type=str, 
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Dataframes/Paris75019_test.csv",
+                        help="Path to the test CSV file")
+    parser.add_argument("--img_dir", type=str, 
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Images",
+                        help="Path to the images directory")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Utilisation de l'appareil : {device}")
 
     # 1. Charger le modèle et les poids fine-tunés
-    weights_path = "megaloc_finetuned_paris.pth"
+    weights_path = args.weights_path
     if not os.path.exists(weights_path):
-        if os.path.exists("MegaLoc/megaloc_finetuned_paris.pth"):
-            weights_path = "MegaLoc/megaloc_finetuned_paris.pth"
+        if os.path.exists(os.path.join("MegaLoc", weights_path)):
+            weights_path = os.path.join("MegaLoc", weights_path)
         else:
             print(f"Erreur : {weights_path} est introuvable. Entraînez d'abord le modèle.")
             return
@@ -34,8 +46,8 @@ def main():
     model.eval()
 
     # 2. Charger les données de test
-    test_csv = "datasets/paris_75018_gsv/Dataframes/Paris75018_test.csv"
-    img_dir = "datasets/paris_75018_gsv/Images"
+    test_csv = args.test_csv
+    img_dir = args.img_dir
 
     if not os.path.exists(test_csv):
         print(f"Erreur : {test_csv} introuvable.")
@@ -152,12 +164,12 @@ def main():
     q_path = q_paths[q_idx]
     
     q_sims = all_sims[q_idx]
-    q_top3_idx = all_top_indices[q_idx][:3]
+    q_top5_idx = all_top_indices[q_idx][:5]
 
-    target_size = (300, 300)
+    target_size = (250, 250)
     spacing = 15
-    width = 4 * target_size[0] + 5 * spacing
-    height = target_size[1] + 80
+    width = 6 * target_size[0] + 7 * spacing
+    height = target_size[1] + 110
     
     combined_img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(combined_img)
@@ -177,13 +189,17 @@ def main():
         combined_img.paste(bordered_img, (x_offset, spacing))
         
         draw.text((x_offset + 5, spacing + target_size[1] + 8), title, fill="black", font=font)
-        draw.text((x_offset + 5, spacing + target_size[1] + 28), subtitle, fill="gray", font=font)
+        # Handle newlines in subtitle
+        y_cursor = spacing + target_size[1] + 25
+        for line in subtitle.split('\n'):
+            draw.text((x_offset + 5, y_cursor), line, fill="gray", font=font)
+            y_cursor += 15
 
     # 1. Dessiner la Requête (Bordure Bleue)
     add_panel(q_path, "QUERY", spacing, (0, 102, 204), f"Place: {q_place}")
 
-    # 2. Dessiner les 3 meilleures correspondances
-    for i, idx in enumerate(q_top3_idx):
+    # 2. Dessiner les 5 meilleures correspondances
+    for i, idx in enumerate(q_top5_idx):
         pred_place = db_places[idx]
         pred_path = db_paths[idx]
         sim = q_sims[idx]
