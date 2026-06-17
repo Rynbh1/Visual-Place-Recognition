@@ -400,7 +400,7 @@ class Aggregator(nn.Module):
 
     def forward(self, x):
         x = self.agg(x)
-        return self.linear(x)
+        return self.linear(x.to(self.linear.weight.dtype))
 
 
 class MegaLoc(nn.Module):

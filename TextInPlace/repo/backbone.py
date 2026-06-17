@@ -1,3 +1,5 @@
+import os, sys
+sys.path.append(os.path.abspath("detectron2"))
 import torch
 from torch import nn
 import torchvision

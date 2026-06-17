@@ -1,449 +1,509 @@
-#!/usr/bin/env python3
 """
-VPR & Text Spotting Orchestrator CLI.
-Integrates MegaLoc visual retrieval with TextInPlace text spotting and Qwen late-fusion reranking.
-Optimized for laptops with 8GB VRAM (NVIDIA RTX 4060).
+VPR Pipeline — CLI entry point.
+
+Usage:
+    # Evaluate Recall@K on a GSV-Cities structured dataset:
+    python -m vpr_pipeline eval \
+        --dataset-path datasets/paris_75018 \
+        --weights-path MegaLoc/Results/trainings/megaloc_finetuned_paris.pth \
+        --top-k 10
+
+    # Single-image inference with late fusion:
+    python -m vpr_pipeline infer \
+        --image-path query.jpg \
+        --dataset-path datasets/paris_75018 \
+        --weights-path MegaLoc/Results/trainings/megaloc_finetuned_paris.pth \
+        --use-ocr
+
+Dataset format (GSV-Cities layout):
+    <dataset-path>/
+      Dataframes/
+        Paris75018.csv          ← overall metadata/manifest
+        Paris75018_train.csv    ← database references (first row per place)
+        Paris75018_test.csv     ← test queries/database
+      Images/
+        Paris75018/
+          Paris75018_0000023_...jpg
 """
+
+from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 import torch
-from PIL import Image, ImageDraw, ImageFont
 
 
-# Add project root directory to path to allow absolute imports
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from vpr_pipeline.utils import clear_vram, load_reranker, late_fusion_rerank
-from vpr_pipeline.retrieval import load_megaloc_model, extract_descriptors, build_faiss_index, search_index
-from vpr_pipeline.ocr import load_ocr_model, spot_text_in_images
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
 
 
-def parse_dataset(dataset_path: Path) -> Tuple[List[Path], List[Path], List[np.ndarray], List[str], List[str]]:
-    """
-    Parses the dataset directory.
-    Supports two structures:
-      1. Folder-based: Scanning dataset_path/places/place_XXXXXX/ for image splits.
-      2. CSV-based: Fallback to reading Dataframes/*_test.csv and matching Images/.
-      
+
+def _load_entries_from_csv(
+    csv_path: Path,
+    images_dir: Path,
+) -> tuple[list[dict], list[dict]]:
+    """Parse a GSV-Cities style CSV layout into (db_entries, query_entries).
+
+    Convention:
+        - The first row (deterministically sorted by year, month, northdeg, panoid)
+          for each place_id is the database ref.
+        - All remaining rows in that place_id group are treated as queries.
+
     Returns:
-        db_paths: paths to database (reference) images
-        q_paths: paths to query images
-        positives_per_query: list of numpy arrays containing database indices of positive matches for each query
-        db_places: place labels for database images
-        q_places: place labels for query images
+        db_entries: list of {path, place_id, lat, lon}
+        query_entries: list of {path, place_id}
     """
-    places_dir = dataset_path / "places"
+    df = pd.read_csv(csv_path)
+    # Ensure deterministic sort order (equivalent to alphabetical sorting of the filenames)
+    df = df.sort_values(by=["place_id", "year", "month", "northdeg", "panoid"]).reset_index(drop=True)
+
+    db_entries: list[dict] = []
+    query_entries: list[dict] = []
+
+    for place_id, group in df.groupby("place_id"):
+        # First row -> database reference
+        db_row = group.iloc[0]
+        db_fname = (
+            f"{db_row['city_id']}_{int(db_row['place_id']):07d}_"
+            f"{int(db_row['year']):04d}_{int(db_row['month']):02d}_"
+            f"{int(db_row['northdeg']):03d}_{db_row['lat']:.7f}_"
+            f"{db_row['lon']:.7f}_{db_row['panoid']}.jpg"
+        )
+        db_img_path = images_dir / db_row["city_id"] / db_fname
+        if db_img_path.exists():
+            db_entries.append({
+                "path": str(db_img_path),
+                "place_id": str(place_id),
+                "lat": float(db_row["lat"]),
+                "lon": float(db_row["lon"]),
+            })
+
+            # Remaining rows -> queries
+            for _, q_row in group.iloc[1:].iterrows():
+                q_fname = (
+                    f"{q_row['city_id']}_{int(q_row['place_id']):07d}_"
+                    f"{int(q_row['year']):04d}_{int(q_row['month']):02d}_"
+                    f"{int(q_row['northdeg']):03d}_{q_row['lat']:.7f}_"
+                    f"{q_row['lon']:.7f}_{q_row['panoid']}.jpg"
+                )
+                q_img_path = images_dir / q_row["city_id"] / q_fname
+                if q_img_path.exists():
+                    query_entries.append({
+                        "path": str(q_img_path),
+                        "place_id": str(place_id),
+                        "lat": float(q_row["lat"]),
+                        "lon": float(q_row["lon"]),
+                    })
+
+    return db_entries, query_entries
+
+
+def _load_db_entries_from_csv(
+    csv_path: Path,
+    images_dir: Path,
+) -> list[dict]:
+    """Build a database from a GSV-Cities style CSV (one reference per place_id).
+
+    Takes the first row per place_id as the database reference image.
+    """
+    db_entries, _ = _load_entries_from_csv(csv_path, images_dir)
+    return db_entries
+
+
+# ---------------------------------------------------------------------------
+# Recall@K metric
+# ---------------------------------------------------------------------------
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    R = 6371000.0  # meters
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
     
-    # 1. Folder-based parsing
-    if places_dir.exists() and places_dir.is_dir():
-        print(f"[Dataset] Found 'places' folder at {places_dir}. Scanning place directories...")
-        db_paths = []
-        q_paths = []
-        db_places = []
-        q_places = []
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def compute_recall(
+    predictions: list[list[dict]],
+    query_entries: list[dict],
+    k_values: tuple[int, ...] = (1, 5, 10),
+) -> dict[str, float]:
+    """Compute Recall@K for a set of queries using place_id OR GPS distance <= 25m.
+
+    Args:
+        predictions: For each query, the ordered list of retrieved results
+                     (dicts with keys: place_id, lat, lon).
+        query_entries: List of query metadata dicts with keys: place_id, lat, lon.
+        k_values: The K values to evaluate.
+
+    Returns:
+        Dict mapping "R@1", "R@5", "R@10" (etc.) to recall in [0, 1].
+    """
+    n = len(query_entries)
+    counts = {k: 0 for k in k_values}
+
+    for preds, q in zip(predictions, query_entries):
+        q_lat, q_lon = q["lat"], q["lon"]
+        q_place_id = q["place_id"]
         
-        place_dirs = sorted([d for d in places_dir.iterdir() if d.is_dir() and d.name.startswith("place_")])
-        for p_dir in place_dirs:
-            place_id = p_dir.name
-            images = sorted([img for img in p_dir.iterdir() if img.suffix.lower() in (".jpg", ".jpeg", ".png")])
-            if not images:
-                continue
+        # Calculate correctness for each retrieved item in preds
+        is_correct_top = []
+        for r in preds:
+            pred_place_id = r["place_id"]
+            pred_lat, pred_lon = r["lat"], r["lon"]
+            dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
+            is_correct_top.append((pred_place_id == q_place_id) or (dist <= 25.0))
             
-            # First image goes to database, others to queries
-            db_paths.append(images[0])
-            db_places.append(place_id)
-            for q_img in images[1:]:
-                q_paths.append(q_img)
-                q_places.append(place_id)
-                
-        # Map query places to their indices in the database
-        positives_per_query = []
-        for q_place in q_places:
-            pos_indices = [idx for idx, db_place in enumerate(db_places) if db_place == q_place]
-            positives_per_query.append(np.array(pos_indices))
-            
-        print(f"[Dataset] Loaded {len(db_paths)} database locations and {len(q_paths)} queries from directories.")
-        return db_paths, q_paths, positives_per_query, db_places, q_places
+        for k in k_values:
+            if any(is_correct_top[:k]):
+                counts[k] += 1
 
-    # 2. CSV-based parsing (Fallback)
-    df_dir = dataset_path / "Dataframes"
-    img_dir = dataset_path / "Images"
-    if df_dir.exists() and img_dir.exists():
-        print(f"[Dataset] places folder not found. Falling back to CSV search under {df_dir}...")
-        csv_files = list(df_dir.glob("*_test.csv"))
-        if not csv_files:
-            csv_files = list(df_dir.glob("*.csv"))
-        if csv_files:
-            csv_path = csv_files[0]
-            print(f"[Dataset] Loading metadata from {csv_path}...")
-            df = pd.read_csv(csv_path)
-            
-            # Map values into dataset paths
-            db_rows = []
-            q_rows = []
-            
-            def get_img_name(row):
-                city = row['city_id']
-                pl_id = f"{row['place_id']:07d}"
-                panoid = str(int(row['panoid'])) if isinstance(row['panoid'], float) and row['panoid'].is_integer() else str(row['panoid'])
-                year = f"{row['year']:04d}"
-                month = f"{row['month']:02d}"
-                northdeg = f"{row['northdeg']:03d}"
-                lat, lon = f"{row['lat']:.7f}", f"{row['lon']:.7f}"
-                return f"{city}_{pl_id}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
-                
-            for pid, group in df.groupby("place_id"):
-                if len(group) >= 2:
-                    db_rows.append(group.iloc[0])
-                    for i in range(1, len(group)):
-                        q_rows.append(group.iloc[i])
-                else:
-                    db_rows.append(group.iloc[0])
-                    
-            db_paths = [img_dir / r['city_id'] / get_img_name(r) for r in db_rows]
-            q_paths = [img_dir / r['city_id'] / get_img_name(r) for r in q_rows]
-            
-            # Filter non-existent images
-            db_exists = [p.exists() for p in db_paths]
-            q_exists = [p.exists() for p in q_paths]
-            
-            db_paths = [p for p, exists in zip(db_paths, db_exists) if exists]
-            db_places = [str(r['place_id']) for r, exists in zip(db_rows, db_exists) if exists]
-            
-            q_paths = [p for p, exists in zip(q_paths, q_exists) if exists]
-            q_places = [str(r['place_id']) for r, exists in zip(q_rows, q_exists) if exists]
-            
-            # Map query places to their indices in the database
-            positives_per_query = []
-            for q_place in q_places:
-                pos_indices = [idx for idx, db_place in enumerate(db_places) if db_place == q_place]
-                positives_per_query.append(np.array(pos_indices))
-                
-            print(f"[Dataset] Loaded {len(db_paths)} database locations and {len(q_paths)} queries from CSV.")
-            return db_paths, q_paths, positives_per_query, db_places, q_places
-            
-    raise FileNotFoundError(f"No place directories or CSV descriptors found at {dataset_path}")
+    return {f"R@{k}": counts[k] / n for k in k_values}
 
 
-def run_evaluation(args):
-    """
-    Executes VPR evaluation pipeline: retrieval, ocr text extraction, reranking, metrics.
-    """
+
+# ---------------------------------------------------------------------------
+# Sub-command: eval
+# ---------------------------------------------------------------------------
+
+def cmd_eval(args: argparse.Namespace) -> None:
+    """Evaluate Recall@1/5/10 on a GSV-Cities structured dataset."""
+    from .retrieval import MegaLocRetriever
+
     dataset_path = Path(args.dataset_path)
-    db_paths, q_paths, positives_per_query, db_places, q_places = parse_dataset(dataset_path)
-    
-    if len(q_paths) == 0:
-        print("[Eval] Error: No query images found for evaluation.")
-        return
-        
-    # ==========================================
-    # 1. MegaLoc Visual Retrieval
-    # ==========================================
-    print("\n" + "=" * 60)
-    print(" 1. VISUAL RETRIEVAL (MegaLoc)")
-    print("=" * 60)
-    megaloc_model, device = load_megaloc_model(args.megaloc_weights)
-    
-    print("[MegaLoc] Extracting database descriptors...")
-    db_descriptors = extract_descriptors(megaloc_model, db_paths, device, batch_size=8)
-    
-    print("[MegaLoc] Extracting query descriptors...")
-    q_descriptors = extract_descriptors(megaloc_model, q_paths, device, batch_size=8)
-    
-    # Unload MegaLoc from VRAM
-    clear_vram(megaloc_model)
-    print("[MegaLoc] Unloaded. VRAM cleared.")
-    
-    # Build FAISS index
-    index = build_faiss_index(db_descriptors)
-    print("[FAISS] Searching visual candidates...")
-    distances, predictions = search_index(index, q_descriptors, top_k=args.top_k)
-    
-    # Calculate recalls before text reranking
-    recalls_visual = np.zeros(3)  # Recall@1, Recall@5, Recall@10
-    recall_values = [1, 5, 10]
-    for query_index, pred in enumerate(predictions):
-        for i, n in enumerate(recall_values):
-            if np.any(np.in1d(pred[:n], positives_per_query[query_index])):
-                recalls_visual[i:] += 1
-                break
-    recalls_visual = recalls_visual / len(q_paths) * 100
-    
-    print("\nVisual recalls (MegaLoc Only):")
-    print(f"  R@1: {recalls_visual[0]:.2f}% | R@5: {recalls_visual[1]:.2f}% | R@10: {recalls_visual[2]:.2f}%")
-    
-    if args.disable_reranking:
-        print("[Eval] Text-based reranking is disabled. Stopping evaluation.")
-        return
-        
-    # ==========================================
-    # 2. Text Spotting (TextInPlace)
-    # ==========================================
-    print("\n" + "=" * 60)
-    print(" 2. TEXT SPOTTING (TextInPlace)")
-    print("=" * 60)
-    ocr_model, device = load_ocr_model(args.textinplace_config, args.textinplace_weights)
-    
-    print("[OCR] Extracting text from query images...")
-    query_texts = spot_text_in_images(ocr_model, q_paths, device)
-    
-    # Identify unique database candidates to only run OCR on visual matches (Optimization)
-    unique_candidates = sorted(list(set(predictions.flatten())))
-    candidate_paths = [db_paths[idx] for idx in unique_candidates]
-    
-    print(f"[OCR] Extracting text from {len(candidate_paths)} candidate database images (out of {len(db_paths)} total)...")
-    candidate_texts_subset = spot_text_in_images(ocr_model, candidate_paths, device)
-    
-    # Map back subset text list to full database list
-    db_texts = [[] for _ in range(len(db_paths))]
-    for subset_idx, db_idx in enumerate(unique_candidates):
-        db_texts[db_idx] = candidate_texts_subset[subset_idx]
-        
-    # Unload TextInPlace from VRAM
-    clear_vram(ocr_model)
-    print("[OCR] Unloaded. VRAM cleared.")
-    
-    # ==========================================
-    # 3. Late Fusion Reranking (Qwen)
-    # ==========================================
-    print("\n" + "=" * 60)
-    print(" 3. LATE FUSION RE-RANKING (Qwen)")
-    print("=" * 60)
-    reranker = load_reranker(args.qwen_model)
-    
-    reranked_predictions = []
-    print("[Reranker] Reranking query candidate lists...")
-    for q_idx, pred in enumerate(predictions):
-        reranked = late_fusion_rerank(reranker, pred, query_texts[q_idx], db_texts, top_k=args.top_k)
-        reranked_predictions.append(reranked)
-        
-    reranked_predictions = np.array(reranked_predictions)
-    
-    # Unload Reranker from VRAM
-    clear_vram(reranker)
-    print("[Reranker] Unloaded. VRAM cleared.")
-    
-    # Calculate recalls after text reranking
-    recalls_fused = np.zeros(3)  # Recall@1, Recall@5, Recall@10
-    for query_index, pred in enumerate(reranked_predictions):
-        for i, n in enumerate(recall_values):
-            if np.any(np.in1d(pred[:n], positives_per_query[query_index])):
-                recalls_fused[i:] += 1
-                break
-    recalls_fused = recalls_fused / len(q_paths) * 100
-    
-    print("\n" + "=" * 60)
-    print("                 FINAL EVALUATION SUMMARY")
-    print("=" * 60)
-    print(f" Dataset       : {dataset_path.name}")
-    print(f" Queries       : {len(q_paths)}")
-    print(f" Database Size : {len(db_paths)}")
-    print("-" * 60)
-    print(f" MegaLoc Only   - R@1: {recalls_visual[0]:.2f}% | R@5: {recalls_visual[1]:.2f}% | R@10: {recalls_visual[2]:.2f}%")
-    print(f" MegaLoc + Qwen - R@1: {recalls_fused[0]:.2f}% | R@5: {recalls_fused[1]:.2f}% | R@10: {recalls_fused[2]:.2f}%")
-    print("=" * 60)
+    weights_path = Path(args.weights_path_megaloc)
 
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"[eval] Device: {device}")
 
-def run_inference(args):
-    """
-    Executes visual place recognition inference on a single query photo.
-    """
-    query_path = Path(args.image_path)
-    if not query_path.exists():
-        raise FileNotFoundError(f"Query image not found at: {query_path}")
-        
-    dataset_path = Path(args.dataset_path)
-    db_paths, _, _, db_places, _ = parse_dataset(dataset_path)
-    
-    # ==========================================
-    # 1. MegaLoc Visual Retrieval
-    # ==========================================
-    print(f"\n[MegaLoc] Running visual descriptor extraction on {query_path.name}...")
-    megaloc_model, device = load_megaloc_model(args.megaloc_weights)
-    
-    q_desc = extract_descriptors(megaloc_model, [query_path], device, batch_size=1)
-    
-    # Extract reference database descriptors (in real systems, loaded from cache)
-    print("[MegaLoc] Extracting database descriptors...")
-    db_descriptors = extract_descriptors(megaloc_model, db_paths, device, batch_size=8)
-    
-    clear_vram(megaloc_model)
-    
-    # Search candidates
-    index = build_faiss_index(db_descriptors)
-    distances, predictions = search_index(index, q_desc, top_k=args.top_k)
-    prediction = predictions[0]
-    distance = distances[0]
-    
-    # ==========================================
-    # 2. Text Spotting (TextInPlace)
-    # ==========================================
-    print(f"\n[OCR] Spotting text in query {query_path.name}...")
-    ocr_model, device = load_ocr_model(args.textinplace_config, args.textinplace_weights)
-    
-    query_text = spot_text_in_images(ocr_model, [query_path], device)[0]
-    
-    cand_paths = [db_paths[idx] for idx in prediction]
-    print(f"[OCR] Spotting text in the top {args.top_k} visual database candidates...")
-    candidate_texts = spot_text_in_images(ocr_model, cand_paths, device)
-    
-    db_texts = [[] for _ in range(len(db_paths))]
-    for subset_idx, db_idx in enumerate(prediction):
-        db_texts[db_idx] = candidate_texts[subset_idx]
-        
-    clear_vram(ocr_model)
-    
-    # ==========================================
-    # 3. Late Fusion Reranking (Qwen)
-    # ==========================================
-    print(f"\n[Reranker] Query text detected: {query_text}")
-    reranker = load_reranker(args.qwen_model)
-    reranked = late_fusion_rerank(reranker, prediction, query_text, db_texts, top_k=args.top_k)
-    clear_vram(reranker)
-    
-    print("\n" + "=" * 80)
-    print("                 SINGLE IMAGE INFERENCE MATCHES (TOP 5)")
-    print("=" * 80)
-    print(f" Query Image  : {query_path.name}")
-    print(f" Query Text   : {query_text}")
-    print("-" * 80)
-    
-    for rank in range(5):
-        if rank >= len(reranked):
-            break
-        idx = reranked[rank]
-        path = db_paths[idx]
-        place_id = db_places[idx]
-        text_spotted = db_texts[idx]
-        
-        # Parse metadata from filename
-        parts = path.stem.split("_")
-        try:
-            # Format: {city_id}_{place_id:07d}_{year:04d}_{month:02d}_{north:03d}_{lat:.7f}_{lon:.7f}_{panoid}
-            lat = float(parts[-3])
-            lon = float(parts[-2])
-            coords_str = f"Lat: {lat:.7f}, Lon: {lon:.7f}"
-            gmaps = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-        except Exception:
-            coords_str = "Unknown coordinates"
-            gmaps = "N/A"
-            
-        # Check if index is in original predictions to get visual distance
-        visual_rank = np.where(prediction == idx)[0]
-        if len(visual_rank) > 0:
-            v_dist = distance[visual_rank[0]]
-            v_info = f"Visual Dist: {v_dist:.4f} (Rank #{visual_rank[0] + 1})"
-        else:
-            v_info = "Visual Rank: >20"
-            
-        print(f" #{rank+1} - Place ID: {place_id} | {path.name}")
-        print(f"     {coords_str} | {v_info}")
-        print(f"     Text Detected: {text_spotted}")
-        print(f"     Google Maps: {gmaps}")
-        print("-" * 80)
-    
-    # Save a comparison comparative matched image panel containing the top 5 candidates
-    target_size = (250, 250)
-    spacing = 15
-    combined_img = Image.new("RGB", (6 * target_size[0] + 7 * spacing, target_size[1] + 130), "white")
-    draw = ImageDraw.Draw(combined_img)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-        
-    def add_panel(img_path, title, x_offset, border_color, subtitle="", text_spotted=[]):
-        img_obj = Image.open(img_path).convert("RGB").resize(target_size)
-        bordered = Image.new("RGB", (target_size[0] + 6, target_size[1] + 6), border_color)
-        bordered.paste(img_obj, (3, 3))
-        combined_img.paste(bordered, (x_offset, spacing))
-        
-        draw.text((x_offset + 5, spacing + target_size[1] + 10), title, fill="black", font=font)
-        # Handle newlines in subtitle
-        y_cursor = spacing + target_size[1] + 25
-        for line in subtitle.split('\n'):
-            draw.text((x_offset + 5, y_cursor), line, fill="gray", font=font)
-            y_cursor += 15
-        draw.text((x_offset + 5, y_cursor + 5), f"Text: {text_spotted}", fill="blue", font=font)
-
-    # Draw query panel
-    add_panel(query_path, "QUERY IMAGE", spacing, (0, 102, 204), text_spotted=query_text)
-    
-    # Draw top 5 panels
-    for rank in range(5):
-        if rank >= len(reranked):
-            break
-        idx = reranked[rank]
-        path = db_paths[idx]
-        place_id = db_places[idx]
-        text_spotted = db_texts[idx]
-        
-        parts = path.stem.split("_")
-        try:
-            lat = float(parts[-3])
-            lon = float(parts[-2])
-            subtitle = f"Place ID: {place_id}\nLat: {lat:.5f}, Lon: {lon:.5f}"
-        except Exception:
-            subtitle = f"Place ID: {place_id}"
-            
-        x_offset = (rank + 1) * target_size[0] + (rank + 2) * spacing
-        # Use green border for the best match, and light grey for others
-        border_color = (46, 204, 113) if rank == 0 else (189, 195, 199)
-        add_panel(path, f"CANDIDATE #{rank+1}", x_offset, border_color, subtitle=subtitle, text_spotted=text_spotted)
-              
-    out_path = Path(args.output_dir) / f"{query_path.stem}_vpr_match.png"
-    combined_img.save(out_path)
-    print(f"[Inference] Comparison panel saved to: {out_path.resolve()}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="MegaLoc + TextInPlace + Qwen Late Fusion VPR Pipeline")
-    subparsers = parser.add_subparsers(dest="mode", required=True, help="Modes: eval (evaluate dataset) or infer (query single image)")
-    
-    # Common arguments
-    common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("--megaloc-weights", type=str, default="MegaLoc/megaloc_finetuned_paris.pth", help="Path to MegaLoc model weights")
-    common_parser.add_argument("--textinplace-config", type=str, default="TextInPlace/repo/configs/Bridge/TotalText/R_50_poly.yaml", help="Path to TextInPlace model configuration")
-    common_parser.add_argument("--textinplace-weights", type=str, default="TextInPlace/repo/checkpoints/Bridge_tt.pth", help="Path to TextInPlace weights")
-    common_parser.add_argument("--qwen-model", type=str, default="Qwen/Qwen3-Reranker-0.6B", help="Model name of local Qwen reranker")
-    common_parser.add_argument("--top-k", type=int, default=20, help="Number of database candidates to query and rerank")
-    
-    # Subparser: eval
-    eval_parser = subparsers.add_parser("eval", parents=[common_parser], help="Evaluate visual place recognition recalls on a complete dataset folder")
-    eval_parser.add_argument("--dataset-path", type=str, required=True, help="Path to the dataset directory (e.g. datasets/paris_75019)")
-    eval_parser.add_argument("--disable-reranking", action="store_true", help="Calculate visual-only recalls without text reranking")
-    eval_parser.set_defaults(func=run_evaluation)
-    
-    # Subparser: infer
-    infer_parser = subparsers.add_parser("infer", parents=[common_parser], help="Find best matches for a single query image")
-    infer_parser.add_argument("--image-path", type=str, required=True, help="Path to the query image file")
-    infer_parser.add_argument("--dataset-path", type=str, required=True, help="Path to the reference database directory")
-    infer_parser.add_argument("--output-dir", type=str, default=".", help="Directory to save the match visualization panel")
-    infer_parser.set_defaults(func=run_inference)
-    
-    args = parser.parse_args()
-    
-    # Explicitly check CUDA availability and log device
-    if torch.cuda.is_available():
-        print(f"[Device] CUDA initialized. Device name: {torch.cuda.get_device_name(0)}")
-        print(f"[Device] VRAM Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+    # ── Load dataset ──────────────────────────────────────────────────
+    print(f"[eval] Scanning dataset: {dataset_path}")
+    if getattr(args, "csv_path", None):
+        csv_path = Path(args.csv_path)
     else:
-        print("[Device] CUDA is not available. Using CPU instead.")
-        
-    try:
-        args.func(args)
-    except Exception as e:
-        print(f"[Error] Execution failed: {e}")
-        import traceback
-        traceback.print_exc()
+        df_dir = dataset_path / "Dataframes"
+        if not df_dir.exists():
+            raise FileNotFoundError(f"Dataframes folder not found in: {dataset_path}")
+        csv_files = list(df_dir.glob("*.csv"))
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in: {df_dir}")
+        test_files = [f for f in csv_files if f.name.endswith("_test.csv")]
+        csv_path = test_files[0] if test_files else csv_files[0]
+
+    print(f"[eval] Using GSV-Cities CSV: {csv_path}")
+
+    images_dir = dataset_path / "Images" if (dataset_path / "Images").exists() else dataset_path
+    db_entries, query_entries = _load_entries_from_csv(csv_path, images_dir)
+    print(f"[eval] Database: {len(db_entries)} places | Queries: {len(query_entries)}")
+
+    if not query_entries:
+        print("[eval] No queries found.")
         sys.exit(1)
+
+    # ── Build retriever + index ───────────────────────────────────────
+    retriever = MegaLocRetriever(
+        weights_path=weights_path,
+        device=device,
+        use_fp16=not args.no_fp16,
+    )
+
+    index_cache: Optional[Path] = None
+    if args.index_cache:
+        index_cache = Path(args.index_cache)
+
+    retriever.build_index(db_entries, index_cache=index_cache)
+
+    # ── Run retrieval for every query ─────────────────────────────────
+    k_max = max(args.top_k, 10)
+    predictions: list[list[dict]] = []
+
+    from tqdm import tqdm
+    for q in tqdm(query_entries, desc="Evaluating queries", ncols=80):
+        results = retriever.search(Path(q["path"]), k=k_max)
+        predictions.append(results)
+
+    # ── Compute and display Recall@K ──────────────────────────────────
+    recalls = compute_recall(predictions, query_entries, k_values=(1, 5, 10))
+
+    print("\n" + "=" * 50)
+    print("  VPR Evaluation Results")
+    print("=" * 50)
+    print(f"  Dataset : {dataset_path.name}")
+    print(f"  Queries : {len(query_entries)}")
+    print(f"  DB size : {len(db_entries)}")
+    print("-" * 50)
+    for metric, value in recalls.items():
+        print(f"  {metric:8s} = {value * 100:.2f} %")
+    print("=" * 50)
+
+
+# ---------------------------------------------------------------------------
+# Sub-command: infer
+# ---------------------------------------------------------------------------
+
+def cmd_infer(args: argparse.Namespace) -> None:
+    """Run the full hybrid pipeline on a single query image."""
+    from .retrieval import MegaLocRetriever
+    from .ocr import SceneTextExtractor, OllamaGeoFilter
+    from .fusion import LateFusionOrchestrator
+
+    image_path = Path(args.image_path)
+    dataset_path = Path(args.dataset_path)
+    weights_path = Path(args.weights_path_megaloc)
+
+    if not image_path.exists():
+        print(f"[infer] Error: image not found: {image_path}")
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"[infer] Device: {device}")
+
+    # ── Build database ────────────────────────────────────────────────
+    if args.csv_path:
+        csv_path = Path(args.csv_path)
+    else:
+        df_dir = dataset_path / "Dataframes"
+        if not df_dir.exists():
+            raise FileNotFoundError(f"Dataframes folder not found in: {dataset_path}")
+        csv_files = list(df_dir.glob("*.csv"))
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in: {df_dir}")
+        train_files = [f for f in csv_files if f.name.endswith("_train.csv")]
+        full_files = [f for f in csv_files if not f.name.endswith("_train.csv") and not f.name.endswith("_test.csv")]
+        if train_files:
+            csv_path = train_files[0]
+        elif full_files:
+            csv_path = full_files[0]
+        else:
+            csv_path = csv_files[0]
+
+    print(f"[infer] Using GSV-Cities CSV for database: {csv_path}")
+
+    images_dir = dataset_path / "Images" if (dataset_path / "Images").exists() else dataset_path
+    db_entries = _load_db_entries_from_csv(
+        csv_path=csv_path,
+        images_dir=images_dir,
+    )
+
+    print(f"[infer] Database: {len(db_entries)} entries")
+
+    # ── Initialise visual retriever ───────────────────────────────────
+    retriever = MegaLocRetriever(
+        weights_path=weights_path,
+        device=device,
+        use_fp16=not args.no_fp16,
+    )
+
+    index_cache: Optional[Path] = Path(args.index_cache) if args.index_cache else None
+    retriever.build_index(db_entries, index_cache=index_cache)
+
+    # ── Initialise OCR + LLM branches ────────────────────────────────
+    text_extractor = SceneTextExtractor(
+        device=device,
+        weights_path=args.weights_path_textinplace,
+    )
+    geo_filter = OllamaGeoFilter(
+        model=args.ollama_model,
+        base_url=args.ollama_url,
+        zone_description=args.zone,
+    )
+
+    if args.use_ocr and not geo_filter.is_available():
+        print(
+            f"[infer] Warning: Ollama not reachable at {args.ollama_url}. "
+            "Proceeding with visual-only mode (OCR disabled)."
+        )
+        args.use_ocr = False
+
+    # ── Late fusion ───────────────────────────────────────────────────
+    if args.use_ocr:
+        orchestrator = LateFusionOrchestrator(
+            retriever=retriever,
+            text_extractor=text_extractor,
+            geo_filter=geo_filter,
+            base_alpha=args.alpha,
+            top_k_visual=args.top_k,
+            top_k_ocr=args.top_k_ocr,
+        )
+        candidates = orchestrator.run(image_path)
+    else:
+        # Visual-only: wrap raw retrieval results as RetrievalCandidate objects
+        from .fusion import RetrievalCandidate
+        raw = retriever.search(image_path, k=args.top_k)
+        scores = [r["visual_score"] for r in raw]
+        s_min, s_max = min(scores), max(scores)
+        s_range = (s_max - s_min) if s_max != s_min else 1.0
+        candidates = [
+            RetrievalCandidate(
+                rank=i,
+                place_id=str(r["place_id"]),
+                lat=r["lat"],
+                lon=r["lon"],
+                db_image_path=Path(r["path"]),
+                visual_score=r["visual_score"],
+                visual_score_norm=(r["visual_score"] - s_min) / s_range,
+                fused_score=(r["visual_score"] - s_min) / s_range,
+                alpha_used=1.0,
+            )
+            for i, r in enumerate(raw)
+        ]
+
+    # ── Print results ─────────────────────────────────────────────────
+    _print_results(image_path, candidates, use_ocr=args.use_ocr)
+
+
+def _print_results(
+    query_path: Path,
+    candidates: list,
+    use_ocr: bool = False,
+) -> None:
+    """Pretty-print the ranked candidate list to stdout."""
+    print("\n" + "=" * 80)
+    print("  VPR Inference Results")
+    print("=" * 80)
+    print(f"  Query : {query_path}")
+    if use_ocr and candidates and candidates[0].extracted_texts:
+        print(f"  OCR   : {candidates[0].extracted_texts[:5]}")
+    print("-" * 80)
+
+    for c in candidates:
+        marker = "★" if c.rank == 0 else f"#{c.rank + 1}"
+        print(f"  {marker:3s}  Place: {c.place_id}")
+        print(f"       Coords       : {c.lat:.6f}, {c.lon:.6f}")
+        print(f"       Visual score : {c.visual_score:.4f}  (norm: {c.visual_score_norm:.3f})")
+        if use_ocr:
+            status = "coherent" if c.text_coherent else "not coherent"
+            print(
+                f"       Text branch  : {status}  "
+                f"(conf={c.text_confidence:.2f}, α={c.alpha_used:.2f})"
+            )
+        print(f"       Fused score  : {c.fused_score:.4f}")
+        print(f"       Maps         : https://maps.google.com/?q={c.lat:.6f},{c.lon:.6f}")
+        print(f"       DB image     : {c.db_image_path.name}")
+        print("-" * 80)
+
+    print("=" * 80)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vpr_pipeline",
+        description="Hybrid VPR pipeline: MegaLoc visual retrieval + OCR late fusion.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # ── Shared arguments ──────────────────────────────────────────────
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--weights-path-megaloc", default="MegaLoc/Results/trainings/megaloc_finetuned_paris.pth",
+        help="Path to the MegaLoc .pth checkpoint.",
+    )
+    shared.add_argument(
+        "--weights-path-textinplace", default="/TextInPlace/repo/checkpoints/best_model.pth",
+        help="Path to the TextInPlace .pth checkpoint.",
+    )
+    shared.add_argument(
+        "--no-fp16", action="store_true",
+        help="Disable fp16 on GPU (use fp32 — doubles VRAM usage).",
+    )
+    shared.add_argument(
+        "--cpu", action="store_true",
+        help="Force CPU inference (slow, but useful for debugging).",
+    )
+    shared.add_argument(
+        "--index-cache", default=None,
+        help="Path to a .faiss cache file. Built on first run, loaded afterwards.",
+    )
+    shared.add_argument(
+        "--top-k", type=int, default=10,
+        help="Number of candidates to retrieve from FAISS.",
+    )
+
+    # ── eval sub-command ──────────────────────────────────────────────
+    eval_p = subparsers.add_parser(
+        "eval",
+        parents=[shared],
+        help="Evaluate Recall@K on a GSV-Cities dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    eval_p.add_argument(
+        "--dataset-path", required=True,
+        help="Root folder of the GSV-Cities dataset (containing Dataframes/ and Images/).",
+    )
+    eval_p.add_argument(
+        "--csv-path", default=None,
+        help="Optional GSV-Cities CSV path for evaluation (defaults to the _test.csv inside Dataframes/).",
+    )
+    eval_p.set_defaults(func=cmd_eval)
+
+    # ── infer sub-command ─────────────────────────────────────────────
+    infer_p = subparsers.add_parser(
+        "infer",
+        parents=[shared],
+        help="Geolocate a single query image with optional OCR late fusion.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    infer_p.add_argument(
+        "--image-path", required=True,
+        help="Path to the query image.",
+    )
+    infer_p.add_argument(
+        "--dataset-path", required=True,
+        help="Root folder of the GSV-Cities dataset (containing Dataframes/ and Images/).",
+    )
+    infer_p.add_argument(
+        "--csv-path", default=None,
+        help="Optional GSV-Cities CSV path to build the database (defaults to the _train.csv inside Dataframes/).",
+    )
+    infer_p.add_argument(
+        "--use-ocr", action="store_true",
+        help="Enable the OCR + Ollama late-fusion branch.",
+    )
+    infer_p.add_argument(
+        "--alpha", type=float, default=0.7,
+        help="Base weight for the visual branch in fusion (0.0–1.0).",
+    )
+    infer_p.add_argument(
+        "--top-k-ocr", type=int, default=5,
+        help="Number of visual candidates to send to the LLM for validation.",
+    )
+    infer_p.add_argument(
+        "--ollama-model", default="qwen3:8b",
+        help="Ollama model tag for the geo-filter.",
+    )
+    infer_p.add_argument(
+        "--ollama-url", default="http://localhost:11434",
+        help="Ollama server base URL.",
+    )
+    infer_p.add_argument(
+        "--zone", default="Paris, France",
+        help="Human-readable zone description passed to the LLM prompt.",
+    )
+    infer_p.set_defaults(func=cmd_infer)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":

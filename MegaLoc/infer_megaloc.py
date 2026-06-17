@@ -17,14 +17,14 @@ from lib.megaloc_model import MegaLoc
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MegaLoc Single-Image Inference Script")
-    parser.add_argument("--query_image", type=str, required=True,
+    parser.add_argument("--query-image", type=str, required=True,
                         help="Path to the query photo to search for")
-    parser.add_argument("--weights_path", type=str, default="megaloc_finetuned_paris.pth",
+    parser.add_argument("--weights-path", type=str, default="megaloc_finetuned_paris.pth",
                         help="Path to the model weights file")
-    parser.add_argument("--db_csv", type=str,
+    parser.add_argument("--db-csv", type=str,
                         default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
                         help="Path to the test/database CSV file to build reference database")
-    parser.add_argument("--img_dir", type=str,
+    parser.add_argument("--img-dir", type=str,
                         default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
                         help="Path to the database images directory")
     args = parser.parse_args()

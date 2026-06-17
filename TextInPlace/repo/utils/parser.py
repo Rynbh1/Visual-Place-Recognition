@@ -6,7 +6,7 @@ def parse_arguments():
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # Ablation parameters
     parser.add_argument("--resize_test_imgs", action="store_true",
-                        help="traing or testing")
+                        help="train or testing")
     parser.add_argument("--use_lora", action="store_true",
                         help="low rank adaption")
     parser.add_argument("--use_extra_datasets", action="store_true",

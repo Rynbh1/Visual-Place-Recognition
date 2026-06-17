@@ -1,4 +1,6 @@
 import os, random
+import sys
+sys.path.append(os.path.abspath("detectron2"))
 import logging
 import numpy as np
 from tqdm import tqdm

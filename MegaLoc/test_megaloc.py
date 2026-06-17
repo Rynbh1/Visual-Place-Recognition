@@ -14,16 +14,31 @@ sys.path.append("./MegaLoc")
 sys.path.append("./MegaLoc/repo")
 from lib.megaloc_model import MegaLoc
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371000.0  # meters
+    lat1_rad = np.radians(lat1)
+    lon1_rad = np.radians(lon1)
+    lat2_rad = np.radians(lat2)
+    lon2_rad = np.radians(lon2)
+    
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MegaLoc Testing Script")
     parser.add_argument("--weights_path", type=str, default="megaloc_finetuned_paris.pth",
                         help="Path to the model weights file")
     parser.add_argument("--test_csv", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Dataframes/Paris75019_test.csv",
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
                         help="Path to the test CSV file")
     parser.add_argument("--img_dir", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/gsv_cities/Images",
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
                         help="Path to the images directory")
     args = parser.parse_args()
 
@@ -89,6 +104,7 @@ def main():
         places = []
         paths = []
         descriptors = []
+        coords = []
         with torch.no_grad():
             for _, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc=f"Extraction {desc_name}"):
                 fname = get_filename(row)
@@ -105,12 +121,13 @@ def main():
                 places.append(row['place_id'])
                 paths.append(path)
                 descriptors.append(desc)
+                coords.append((row['lat'], row['lon']))
                 
-        return np.array(places), paths, np.array(descriptors)
+        return np.array(places), paths, np.array(descriptors), coords
 
     # Extraction des descripteurs
-    db_places, db_paths, db_matrix = extract_descriptors(db_df, "Database")
-    q_places, q_paths, q_matrix = extract_descriptors(q_df, "Queries")
+    db_places, db_paths, db_matrix, db_coords = extract_descriptors(db_df, "Database")
+    q_places, q_paths, q_matrix, q_coords = extract_descriptors(q_df, "Queries")
 
     if len(db_matrix) == 0 or len(q_matrix) == 0:
         print("Erreur : Aucun descripteur n'a pu être extrait.")
@@ -129,23 +146,30 @@ def main():
     for i in range(n_queries):
         q_place = q_places[i]
         q_desc = q_matrix[i]
+        q_lat, q_lon = q_coords[i]
 
         # Similarité cosine (produit scalaire simple car normés L2)
         sims = np.dot(db_matrix, q_desc)
         
         # Classer du plus similaire au moins similaire
         top_indices = np.argsort(-sims)
-        top_places = db_places[top_indices]
 
         all_top_indices.append(top_indices)
         all_sims.append(sims)
 
-        # Métriques de rappel
-        if q_place == top_places[0]:
+        # Recall metrics using exact place ID OR distance <= 25m
+        is_correct_top = []
+        for idx in top_indices[:10]:
+            pred_place = db_places[idx]
+            pred_lat, pred_lon = db_coords[idx]
+            dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
+            is_correct_top.append((pred_place == q_place) or (dist <= 25.0))
+
+        if is_correct_top[0]:
             correct_r1 += 1
-        if q_place in top_places[:5]:
+        if any(is_correct_top[:5]):
             correct_r5 += 1
-        if q_place in top_places[:10]:
+        if any(is_correct_top[:10]):
             correct_r10 += 1
 
     print("\n" + "=" * 50)
@@ -162,6 +186,7 @@ def main():
     q_idx = random.randint(0, n_queries - 1)
     q_place = q_places[q_idx]
     q_path = q_paths[q_idx]
+    q_lat, q_lon = q_coords[q_idx]
     
     q_sims = all_sims[q_idx]
     q_top5_idx = all_top_indices[q_idx][:5]
@@ -196,20 +221,22 @@ def main():
             y_cursor += 15
 
     # 1. Dessiner la Requête (Bordure Bleue)
-    add_panel(q_path, "QUERY", spacing, (0, 102, 204), f"Place: {q_place}")
+    add_panel(q_path, "QUERY", spacing, (0, 102, 204), f"Place: {q_place}\nLat: {q_lat:.5f}, Lon: {q_lon:.5f}")
 
     # 2. Dessiner les 5 meilleures correspondances
     for i, idx in enumerate(q_top5_idx):
         pred_place = db_places[idx]
         pred_path = db_paths[idx]
         sim = q_sims[idx]
+        pred_lat, pred_lon = db_coords[idx]
         
-        is_correct = (pred_place == q_place)
+        dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
+        is_correct = (pred_place == q_place) or (dist <= 25.0)
         # Vert si correct, Rouge si incorrect
         border_color = (46, 204, 113) if is_correct else (231, 76, 60)
         
         title = f"TOP-{i+1} " + ("(CORRECT)" if is_correct else "(WRONG)")
-        subtitle = f"Sim: {sim:.3f}\nPlace: {pred_place}"
+        subtitle = f"Sim: {sim:.3f}\nPlace: {pred_place}\nDist: {dist:.1f}m"
         
         x_offset = (i + 1) * target_size[0] + (i + 2) * spacing
         add_panel(pred_path, title, x_offset, border_color, subtitle)

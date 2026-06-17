@@ -1,4 +1,5 @@
 import os, sys
+sys.path.append(os.path.abspath("detectron2"))
 import logging
 from datetime import datetime
 

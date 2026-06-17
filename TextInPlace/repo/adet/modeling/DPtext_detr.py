@@ -16,7 +16,7 @@ from adet.utils.misc import NestedTensor, box_xyxy_to_cxcywh
 from DiG.models.model_builder import RecModel
 
 from detectron2.structures import Boxes
-from detectron2.modeling.poolers import ROIPooler, cat
+from detectron2.modeling.poolers import ROIPooler
 from functools import partial
 from DiG.loss import SeqCrossEntropyLoss
 from .adapter import Adapter

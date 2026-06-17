@@ -1,135 +1,281 @@
 #!/usr/bin/env python3
-import os
 import sys
-import argparse
-import logging
+import os
+import string
+import torch
+import pandas as pd
 import numpy as np
+import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-import torch
-from torch.utils.data import DataLoader, Subset
+# Add local path for sub-modules
+repo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo")
+sys.path.append(repo_path)
+sys.path.append(os.path.join(repo_path, "detectron2"))
 
-# Custom argument preprocessing: parse query_image and remove it from sys.argv
-parser_query = argparse.ArgumentParser(add_help=False)
-parser_query.add_argument("--query_image", type=str, required=True,
-                          help="Path to the query photo to search for")
-query_args, remaining_args = parser_query.parse_known_args()
-# Resolve query image path to absolute path before changing directory
-query_args.query_image = os.path.abspath(query_args.query_image)
-sys.argv = [sys.argv[0]] + remaining_args
-
-# Dynamically switch paths to repo subfolder so all modules load natively
-os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo"))
-sys.path.append(".")
-
-from utils import util, parser, commons, test
-from network import STVGLNet
-from datasets import paris_75018
+from network import STVGLNet_test
 from backbone import setup_cfg
 
-def main():
-    torch.backends.cudnn.benchmark = True
+# Vocabulary for decoding text predictions
+voc = list(string.printable[:-6])
 
-    # Parse remaining standard training/testing CLI args
-    args = parser.parse_arguments()
+def rec_decode(rec):
+    s = ''
+    for c in rec:
+        c = int(c)
+        if c < len(voc):
+            s += voc[c]
+        elif c == len(voc):
+            return s
+        else:
+            s += u''
+    return s
+
+def get_detected_text(predictions):
+    if len(predictions) == 0:
+        return []
+    pred = predictions[0]  # batch size is 1
+    if "instances" not in pred:
+        return []
+    instances = pred["instances"].to("cpu")
+    if not hasattr(instances, "recs"):
+        return []
+    rec_strings = []
+    for rec in instances.recs:
+        rec_strings.append(rec_decode(rec))
+    return rec_strings
+
+def get_image_path(row, img_dir):
+    city = row['city_id']
+    place_id = int(row['place_id'])
     
-    # Configure logging to console=info to keep it clean
-    from datetime import datetime
-    start_time = datetime.now()
-    args.save_dir = os.path.join(
-        "logs",
-        args.save_dir,
-        args.backbone + "_" + args.aggregation,
-        "paris_75018_inference",
-        start_time.strftime('%Y-%m-%d_%H-%M-%S')
-    )
-    commons.setup_logging(args.save_dir, console="info")
+    # Extract year, month, northdeg, lat, lon, panoid
+    year = str(row['year']).zfill(4)
+    month = str(row['month']).zfill(2)
+    northdeg = str(row['northdeg']).zfill(3)
+    lat, lon = f"{row['lat']:.7f}", f"{row['lon']:.7f}"
     
+    value = row['panoid']
+    if isinstance(value, float) and value.is_integer():
+        panoid = str(int(value))
+    else:
+        panoid = str(value)
+
+    # Pattern 1: Paris75018 / Paris75019 dataset format (with % 10**5 and 7-digit place_id)
+    pl_id = place_id % 10**5
+    pl_id_str = str(pl_id).zfill(7)
+    name1 = f"{city}_{pl_id_str}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
+    path1 = os.path.join(img_dir, city, name1)
+    if os.path.exists(path1):
+        return path1
+
+    # Pattern 2: MegaLoc/Standard GSV format (direct 7-digit place_id)
+    name2 = f"{city}_{place_id:07d}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
+    path2 = os.path.join(img_dir, city, name2)
+    if os.path.exists(path2):
+        return path2
+
+    return None
+
+def normalize_desc(desc):
+    norm = np.linalg.norm(desc)
+    if norm == 0:
+        return desc
+    return desc / norm
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config = os.path.join(script_dir, "repo", "configs", "Bridge", "TotalText", "R_50_poly.yaml")
+    default_weights = os.path.join(script_dir, "repo", "checkpoints", "best_model.pth")
+
+    import argparse
+    parser = argparse.ArgumentParser(description="TextInPlace Single-Image Inference Script")
+    parser.add_argument("--query-image", type=str, required=True,
+                        help="Path to the query photo to search for")
+    parser.add_argument("--weights-path", type=str, default=default_weights,
+                        help="Path to the model weights file")
+    parser.add_argument("--db-csv", type=str,
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
+                        help="Path to the test/database CSV file to build reference database")
+    parser.add_argument("--img-dir", type=str,
+                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
+                        help="Path to the database images directory")
+    parser.add_argument("--config-file", type=str,
+                        default=default_config,
+                        help="Path to Detectron2/AdelaiDet config file")
+    parser.add_argument("--confidence-threshold", type=float, default=0.3,
+                        help="Minimum score for instance predictions")
+    parser.add_argument("--features-dim", type=int, default=16384,
+                        help="VPR features dimension")
+    parser.add_argument("--opts", help="Modify config options", default=[], nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
+    print(f"Device : {device}")
 
     # Check query image exists
-    query_image_path = query_args.query_image
-    if not os.path.exists(query_image_path):
-        logging.error(f"Query image '{query_image_path}' not found.")
+    if not os.path.exists(args.query_image):
+        print(f"Error: Query image '{args.query_image}' not found.")
         return
 
-    # Load dataset test split (reference database)
-    logging.info(f"Loading reference database from datasets folder: {args.datasets_folder}")
-    test_ds = paris_75018.Paris75018Dataset(args, split='test')
-    
-    # Extract only the database reference part of the dataset
-    database_subset_ds = Subset(test_ds, list(range(test_ds.database_num)))
-    database_dataloader = DataLoader(
-        dataset=database_subset_ds,
-        num_workers=args.num_workers,
-        batch_size=args.infer_batch_size,
-        pin_memory=True
-    )
-    logging.info(f"Reference database contains {test_ds.database_num} locations.")
+    # Check config file exists
+    if not os.path.exists(args.config_file):
+        print(f"Error: Config file '{args.config_file}' not found.")
+        return
 
-    # Load model
+    # Load weights first to detect features-dim
+    weights_path = args.weights_path
+    if not os.path.exists(weights_path):
+        print(f"Error: Weights '{weights_path}' not found.")
+        return
+
+    print(f"Loading weights checkpoint from {weights_path}...")
+    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+
+    # Auto-detect VPR features dimension
+    detected_features_dim = args.features_dim
+    for k, v in state_dict.items():
+        if k.endswith("aggregation.fc.weight"):
+            detected_row_dim = v.shape[0]
+            detected_features_dim = detected_row_dim * 512
+            print(f"Detected features_dim from weights checkpoint: {detected_features_dim}")
+            break
+
+    args.features_dim = detected_features_dim
+
+    # Load config and model
+    print(f"Setting up Detectron2 config from {args.config_file}...")
     cfg = setup_cfg(args)
-    model = STVGLNet(cfg)
+    model = STVGLNet_test(cfg)
+    
+    # If the model contains DataParallel module prefix, remove it
+    if list(state_dict.keys())[0].startswith('module'):
+        from collections import OrderedDict
+        state_dict = OrderedDict({k.replace('module.', ''): v for (k, v) in state_dict.items()})
+
+    # Prefix text spotting keys if they are not already prefixed
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        if not k.startswith("backbone.textmodel.") and (k.startswith("dptext_detr.") or k.startswith("recognizer.") or k.startswith("bridge.")):
+            new_state_dict[f"backbone.textmodel.{k}"] = v
+        else:
+            new_state_dict[k] = v
+    state_dict = new_state_dict
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        print(f"Strict loading failed: {e}. Retrying with strict=False")
+        model.load_state_dict(state_dict, strict=False)
+
     model = model.to(device)
-    if args.resume:
-        logging.info(f"Loading weights from {args.resume}")
-        model = util.resume_model(args, model)
     model.eval()
 
-    # Pre-extract database features
-    db_features = np.empty((test_ds.database_num, args.features_dim), dtype="float32")
-    
-    logging.info("Extracting descriptors for the reference database...")
-    with torch.no_grad():
-        for inputs, indices in tqdm(database_dataloader, ncols=100):
-            features = model(inputs.to(device))
-            db_features[indices.numpy(), :] = features.cpu().numpy()
+    # Load database images from CSV
+    if not os.path.exists(args.db_csv):
+        print(f"Error: Database CSV '{args.db_csv}' not found.")
+        return
 
-    # Extract features for query image
-    logging.info(f"Extracting features for query image: {query_image_path}")
-    query_img = Image.open(query_image_path).convert("RGB")
-    query_tensor = test_ds.transform(query_img).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        query_feat = model(query_tensor).cpu().numpy().flatten()
+    df = pd.read_csv(args.db_csv)
+    # Group by place_id and take first image of each place as reference
+    db_rows = []
+    for pid, group in df.groupby("place_id"):
+        db_rows.append(group.iloc[0])
+    db_df = pd.DataFrame(db_rows)
+    print(f"Reference database built with {len(db_df)} locations.")
 
-    # Compute Euclidean (L2) distance to find best matches
-    dists = np.sum((db_features - query_feat) ** 2, axis=1)
-    top5_indices = np.argsort(dists)[:5]
+    # Image transformations
+    val_transform = T.Compose([
+        T.Resize((320, 320), interpolation=T.InterpolationMode.BILINEAR),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Pre-extract database descriptors and texts
+    db_places = []
+    db_paths = []
+    db_coords = []
+    db_descriptors = []
+    db_texts = []
     
-    logging.info("\n" + "=" * 80)
-    logging.info("                 INFERENCE MATCH RESULTS (TOP 5)")
-    logging.info("=" * 80)
-    logging.info(f" Query Photo  : {query_image_path}")
-    logging.info("-" * 80)
+    print("Extracting reference database descriptors and scene texts...")
+    with torch.no_grad():
+        for _, row in tqdm(db_df.iterrows(), total=len(db_df)):
+            path = get_image_path(row, args.img_dir)
+            if path is None or not os.path.exists(path):
+                continue
+            
+            img = Image.open(path).convert("RGB")
+            tensor = val_transform(img).unsqueeze(0).to(device)
+            
+            # Forward pass to get text spotting predictions and features
+            predictions, frozen_features = model(tensor)
+            
+            # VPR descriptor extraction
+            desc = model.vpr_branch(frozen_features).cpu().numpy().flatten()
+            desc = normalize_desc(desc)
+            
+            # Decode scene text
+            detected_words = get_detected_text(predictions)
+            
+            db_places.append(row['place_id'])
+            db_paths.append(path)
+            db_coords.append((row['lat'], row['lon']))
+            db_descriptors.append(desc)
+            db_texts.append(detected_words)
+
+    db_matrix = np.array(db_descriptors)
+    if len(db_matrix) == 0:
+        print("Error: No database descriptors could be extracted.")
+        return
+
+    # Extract descriptor and text for user query image
+    print(f"Extracting descriptor and scene text for query image: {args.query_image}")
+    query_img = Image.open(args.query_image).convert("RGB")
+    query_tensor = val_transform(query_img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        q_predictions, q_frozen_features = model(query_tensor)
+        query_desc = model.vpr_branch(q_frozen_features).cpu().numpy().flatten()
+        query_desc = normalize_desc(query_desc)
+        query_text = get_detected_text(q_predictions)
+
+    print(f"Query Detected Text: {query_text}")
+
+    # Calculate cosine similarity scores
+    sims = np.dot(db_matrix, query_desc)
+    top5_indices = np.argsort(-sims)[:5]
+
+    print("\n" + "=" * 80)
+    print("                 INFERENCE MATCH RESULTS (TOP 5)")
+    print("=" * 80)
+    print(f" Query Photo  : {args.query_image}")
+    print(f" Detected Text: {', '.join(query_text) if query_text else 'None'}")
+    print("-" * 80)
     
     for rank, idx in enumerate(top5_indices):
-        matched_path = test_ds.database_paths[idx]
-        best_dist = dists[idx]
-        
-        # Parse coordinates and metadata from filename
-        basename = os.path.basename(matched_path)
-        parts = basename.replace(".jpg", "").split("_")
-        try:
-            matched_lat = float(parts[-3])
-            matched_lon = float(parts[-2])
-            matched_place = parts[-7]
-        except Exception:
-            matched_lat, matched_lon, matched_place = 0.0, 0.0, "unknown"
-            
-        logging.info(f" #{rank+1} - Place ID: {matched_place} | {basename}")
-        logging.info(f"     L2 Distance : {best_dist:.4f}")
-        logging.info(f"     Coordinates : Latitude = {matched_lat:.7f}, Longitude = {matched_lon:.7f}")
-        logging.info(f"     Google Maps : https://www.google.com/maps/search/?api=1&query={matched_lat},{matched_lon}")
-        logging.info("-" * 80)
-    logging.info("=" * 80)
+        matched_place = db_places[idx]
+        matched_path = db_paths[idx]
+        matched_lat, matched_lon = db_coords[idx]
+        matched_words = db_texts[idx]
+        sim = sims[idx]
+        print(f" #{rank+1} - Place ID: {matched_place} | {os.path.basename(matched_path)}")
+        print(f"     Sim Score   : {sim:.4f}")
+        print(f"     Detected Text: {', '.join(matched_words) if matched_words else 'None'}")
+        print(f"     Coordinates : Latitude = {matched_lat:.7f}, Longitude = {matched_lon:.7f}")
+        print(f"     Google Maps : https://www.google.com/maps/search/?api=1&query={matched_lat},{matched_lon}")
+        print("-" * 80)
+    print("=" * 80)
 
-    # Save visualization comparative match image with the top 5 candidates
+    # Save a comparison result image with the top 5 candidates
     target_size = (250, 250)
     spacing = 15
-    combined_img = Image.new("RGB", (6 * target_size[0] + 7 * spacing, target_size[1] + 110), "white")
+    combined_img = Image.new("RGB", (6 * target_size[0] + 7 * spacing, target_size[1] + 130), "white")
     draw = ImageDraw.Draw(combined_img)
     try:
         font = ImageFont.load_default()
@@ -142,38 +288,31 @@ def main():
         bordered.paste(img, (3, 3))
         combined_img.paste(bordered, (x_offset, spacing))
         draw.text((x_offset + 5, spacing + target_size[1] + 8), title, fill="black", font=font)
-        # Handle newlines in subtitle
         y_cursor = spacing + target_size[1] + 25
         for line in subtitle.split('\n'):
             draw.text((x_offset + 5, y_cursor), line, fill="gray", font=font)
             y_cursor += 15
 
-    add_panel(query_img, "QUERY PHOTO", spacing, (0, 102, 204))
+    q_sub = f"Text: {', '.join(query_text)[:20]}" if query_text else "Text: None"
+    add_panel(query_img, "QUERY PHOTO", spacing, (0, 102, 204), q_sub)
     
     for rank, idx in enumerate(top5_indices):
-        matched_path = test_ds.database_paths[idx]
-        best_dist = dists[idx]
+        matched_place = db_places[idx]
+        matched_path = db_paths[idx]
+        matched_lat, matched_lon = db_coords[idx]
+        matched_words = db_texts[idx]
+        sim = sims[idx]
         
-        # Parse coordinates and metadata from filename
-        basename = os.path.basename(matched_path)
-        parts = basename.replace(".jpg", "").split("_")
-        try:
-            matched_lat = float(parts[-3])
-            matched_lon = float(parts[-2])
-            matched_place = parts[-7]
-        except Exception:
-            matched_lat, matched_lon, matched_place = 0.0, 0.0, "unknown"
-            
         match_img = Image.open(matched_path).convert("RGB")
         border_color = (46, 204, 113) if rank == 0 else (189, 195, 199)
         x_offset = (rank + 1) * target_size[0] + (rank + 2) * spacing
-        add_panel(match_img, f"CANDIDATE #{rank+1}", x_offset, border_color,
-                  f"Dist: {best_dist:.3f}\nPlace: {matched_place}\nLat: {matched_lat:.5f}, Lon: {matched_lon:.5f}")
+        
+        c_sub = f"Sim: {sim:.3f}\nPlace: {matched_place}\nText: {', '.join(matched_words)[:15]}\nLat: {matched_lat:.5f}, Lon: {matched_lon:.5f}"
+        add_panel(match_img, f"CANDIDATE #{rank+1}", x_offset, border_color, c_sub)
 
-    # Save output to TextInPlace/ folder
-    output_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "textinplace_match.png")
+    output_path = "textinplace_match.png"
     combined_img.save(output_path)
-    logging.info(f"Comparison image saved to: {os.path.abspath(output_path)}")
+    print(f"Comparison image saved to: {os.path.abspath(output_path)}")
 
 if __name__ == "__main__":
     main()

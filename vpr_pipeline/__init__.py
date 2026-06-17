@@ -1,1 +1,1 @@
-# Modular VPR & Text Spotting Pipeline Package
+"""Hybrid VPR pipeline: MegaLoc visual retrieval + OCR late fusion."""

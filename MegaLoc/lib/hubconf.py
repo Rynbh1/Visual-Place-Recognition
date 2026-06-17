@@ -9,7 +9,7 @@ dependencies = ["torch", "torchvision", "huggingface_hub"]
 
 import torch  # noqa: E402
 
-from megaloc_model import MegaLoc  # noqa: E402
+from lib.megaloc_model import MegaLoc  # noqa: E402
 
 
 def get_trained_model() -> torch.nn.Module:

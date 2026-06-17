@@ -33,7 +33,7 @@ class STVGLNet_test(nn.Module):
                     proj_channels=512,
                     num_queries=64,
                     num_layers=2,
-                    row_dim=16384//512,
+                    row_dim=cfg.features_dim//512,
         )
 
     def forward(self, x):
