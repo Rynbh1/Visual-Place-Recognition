@@ -34,7 +34,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import download_paris_datasets as paris  # reutilise la logique Paris validee
+import lib.download_paris_datasets as paris  # reutilise la logique Paris validee
 
 # Identifiants (fichier git-ignore ; voir secrets_local.py).
 try:
@@ -58,7 +58,7 @@ MS_FULL_GB = 3200.0
 MSLS_TOTAL_GB = 56.0
 MS_AVG_BYTES = 290 * 1024          # taille moyenne mesuree d'une image MegaScenes
 MS_PARIS_GB = 49643 * MS_AVG_BYTES / GB  # ~13.7 Go
-DISK_MARGIN_GB = 30.0              # marge de securite laissee libre
+DISK_MARGIN_GB = 10              # marge de securite laissee libre
 
 
 def gb(n_bytes):
@@ -248,6 +248,19 @@ def msls_download(dest, urls):
 def compute_ms_budget(args, dest, enabled):
     """Espace (octets) alloue a MegaScenes selon le disque cible et les autres
     datasets actives sur le meme disque."""
+    if getattr(args, "size", None) is not None:
+        other_datasets_gb = 0.0
+        if "osv" in enabled:
+            other_datasets_gb += OSV_FULL_GB
+        if "gsv" in enabled:
+            other_datasets_gb += GSV_GB
+        if "sfxl" in enabled:
+            other_datasets_gb += SFXL_GB[args.sfxl_version]
+        if "msls" in enabled:
+            other_datasets_gb += MSLS_TOTAL_GB
+        
+        ms_budget_gb = max(0.0, args.size - other_datasets_gb)
+        return ms_budget_gb * GB
     if args.megascenes_budget_gb is not None:
         return args.megascenes_budget_gb * GB
     target = Path(args.extern_disk) if args.extern_disk else dest
@@ -305,6 +318,8 @@ def main():
     ap.add_argument("--dest", type=Path, default=SCRIPT_DIR / "datasets")
     ap.add_argument("--extern-disk", default=None,
                     help="Chemin d'un disque externe (cible + budget de MegaScenes)")
+    ap.add_argument("--size", type=float, default=None,
+                    help="Taille totale cible pour le telechargement en Go (ajuste MegaScenes)")
     ap.add_argument("--megascenes-budget-gb", type=float, default=None,
                     help="Force le budget MegaScenes (Go) au lieu de l'auto-detection")
     ap.add_argument("--sfxl-version", choices=["small", "processed", "raw"], default="small")

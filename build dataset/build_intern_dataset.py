@@ -75,7 +75,7 @@ def build_parser():
     common.add_argument(
         "--method",
         choices=["pano-crop", "shared", "both"],
-        default="pano-crop",
+        default="both",
         help="pano-crop=panoramas 360 recadres vers le centre ; "
         "shared=perspectives partagees telles quelles ; "
         "both=les deux dans le meme lieu (pano_<cap>.jpg + flat_<cap>.jpg)",
@@ -94,7 +94,9 @@ def build_parser():
         "(defaut = --views ; mettre 1 pour tout garder)",
     )
     common.add_argument(
-        "--fov", type=float, default=90.0,
+        "--fov",
+        type=float,
+        default=90.0,
         help="(pano-crop) champ de vision horizontal des crops en degres",
     )
     common.add_argument(
@@ -157,18 +159,39 @@ def build_parser():
     px.add_argument(
         "--dataset", required=True, help="Dossier du dataset (contenant manifest.jsonl)"
     )
-    px.add_argument("--out", default=None, help="Dossier de sortie (defaut: <dataset>/gsv_cities)")
-    px.add_argument("--city-id", default=None,
-                    help="Nom de ville (city_id GSV-Cities ; defaut: nom du dossier)")
-    px.add_argument("--test-ratio", type=float, default=0.2,
-                    help="Proportion de blocs en test (defaut: 0.2)")
-    px.add_argument("--test-block", type=float, default=250.0,
-                    help="Taille des blocs train/test en m (defaut: 250)")
-    px.add_argument("--separation", type=float, default=50.0,
-                    help="Zone tampon train/test en m, anti-fuite (defaut: 50)")
-    px.add_argument("--min-imgs", type=int, default=4,
-                    help="Nb min d'images par lieu pour le garder (defaut: 4, "
-                    "= img_per_place de GSV-Cities)")
+    px.add_argument(
+        "--out", default=None, help="Dossier de sortie (defaut: <dataset>/gsv_cities)"
+    )
+    px.add_argument(
+        "--city-id",
+        default=None,
+        help="Nom de ville (city_id GSV-Cities ; defaut: nom du dossier)",
+    )
+    px.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.2,
+        help="Proportion de blocs en test (defaut: 0.2)",
+    )
+    px.add_argument(
+        "--test-block",
+        type=float,
+        default=250.0,
+        help="Taille des blocs train/test en m (defaut: 250)",
+    )
+    px.add_argument(
+        "--separation",
+        type=float,
+        default=50.0,
+        help="Zone tampon train/test en m, anti-fuite (defaut: 50)",
+    )
+    px.add_argument(
+        "--min-imgs",
+        type=int,
+        default=4,
+        help="Nb min d'images par lieu pour le garder (defaut: 4, "
+        "= img_per_place de GSV-Cities)",
+    )
     px.set_defaults(func=cmd_export)
     return p
 
