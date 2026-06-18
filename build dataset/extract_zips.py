@@ -8,6 +8,7 @@ Supports resuming: compares file count in zip vs already extracted files.
 """
 
 import sys
+import os
 import subprocess
 import argparse
 import time
@@ -32,8 +33,15 @@ def count_extracted_files(subdir):
     return sum(1 for f in subdir.rglob("*") if f.is_file())
 
 
+def make_progress_bar(percentage, width=20):
+    percentage = max(0.0, min(1.0, percentage))
+    filled = int(round(width * percentage))
+    bar = "█" * filled + "░" * (width - filled)
+    return bar
+
+
 def extract_zip(args):
-    zip_path, output_dir = args
+    zip_path, output_dir, show_progress = args
     stem = zip_path.stem
     subdir = Path(output_dir) / stem
     start = time.time()
@@ -49,17 +57,67 @@ def extract_zip(args):
             return zip_path.name, "SKIP", 0.0, f"{already_extracted}/{total_in_zip} files already present"
 
         # Use -n (never overwrite) to resume a partial extraction,
-        # or -o (overwrite) for a fresh one — both work here since -n
-        # skips existing files and extracts the rest.
+        # or -o (overwrite) for a fresh one.
         flag = "-n" if already_extracted > 0 else "-o"
         status_prefix = "RESUME" if already_extracted > 0 else "EXTRACT"
 
-        cmd = ["unzip", flag, "-q", str(zip_path), "-d", str(output_dir)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        elapsed = time.time() - start
+        if not show_progress:
+            # Silent execution for multiple workers to avoid inter-process terminal clutter
+            print(f"[{status_prefix}] Starting {zip_path.name} ({already_extracted}/{total_in_zip} files)...", flush=True)
+            cmd = ["unzip", flag, "-q", str(zip_path), "-d", str(output_dir)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            elapsed = time.time() - start
+            if result.returncode not in (0, 1):
+                return zip_path.name, "FAIL", elapsed, result.stderr.strip()
+        else:
+            # Interactive progress bar for single-worker mode
+            cmd = ["unzip", flag, str(zip_path), "-d", str(output_dir)]
+            env = os.environ.copy()
+            env["LC_ALL"] = "C"
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
 
-        if result.returncode not in (0, 1):  # unzip returns 1 for warnings
-            return zip_path.name, "FAIL", elapsed, result.stderr.strip()
+            extracted_count = already_extracted
+            last_update = time.time()
+            last_progress_print = time.time()
+
+            # Read stdout line by line to track progress
+            for line in process.stdout:
+                if any(x in line for x in ("extracting:", "inflating:", "linking:")):
+                    extracted_count += 1
+                    current_time = time.time()
+                    if current_time - last_update >= 0.1 or extracted_count == total_in_zip:
+                        last_update = current_time
+                        pct = extracted_count / total_in_zip if total_in_zip > 0 else 0.0
+                        elapsed = current_time - start
+                        rate = (extracted_count - already_extracted) / elapsed if elapsed > 0 else 0.0
+                        rate_str = f"{rate:.1f} f/s" if rate > 0 else "- f/s"
+                        rem_files = total_in_zip - extracted_count
+                        eta = rem_files / rate if rate > 0 else 0
+                        eta_str = f"ETA {format_eta(eta)}" if rate > 0 else "ETA -"
+
+                        bar = make_progress_bar(pct, width=20)
+                        print(
+                            f"\r[{status_prefix}] {zip_path.name}: [{bar}] {pct*100:5.1f}% "
+                            f"({extracted_count}/{total_in_zip} files) | {rate_str} | {eta_str}",
+                            end="",
+                            flush=True
+                        )
+
+            returncode = process.wait()
+            stderr_content = process.stderr.read()
+            elapsed = time.time() - start
+
+            print()  # Finalize progress bar line
+
+            if returncode not in (0, 1):
+                return zip_path.name, "FAIL", elapsed, stderr_content.strip()
 
         final_count = count_extracted_files(subdir)
         if final_count < total_in_zip:
@@ -99,7 +157,7 @@ def main():
     parser.add_argument(
         "-w", "--workers",
         type=int,
-        default=4,
+        default=1,
         help="Number of parallel workers (default: 4; use 1-2 for slow USB HDDs)",
     )
     parser.add_argument(
@@ -123,19 +181,19 @@ def main():
             print(f"WARNING: no zip files found in {source}")
             continue
         for z in zips:
-            all_tasks.append((z, output))
+            all_tasks.append((z, output, args.workers == 1))
 
     if not all_tasks:
         print("No zip files found in any source directory.")
         sys.exit(1)
 
-    total_size = sum(z.stat().st_size for z, _ in all_tasks)
+    total_size = sum(z.stat().st_size for z, _, _ in all_tasks)
     print(f"Found {len(all_tasks)} zip files ({total_size / 1e9:.1f} GB total)")
     print(f"Workers    : {args.workers}")
     print()
 
     if args.dry_run:
-        for z, out in all_tasks:
+        for z, out, _ in all_tasks:
             stem = z.stem
             subdir = out / stem
             already = count_extracted_files(subdir)
