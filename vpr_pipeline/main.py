@@ -15,6 +15,7 @@ Usage:
         --weights-path MegaLoc/Results/trainings/megaloc_finetuned_paris.pth \
         --use-ocr
 
+
 Dataset format (GSV-Cities layout):
     <dataset-path>/
       Dataframes/
@@ -359,8 +360,31 @@ def cmd_infer(args: argparse.Namespace) -> None:
             for i, r in enumerate(raw)
         ]
 
+    # ── Geometric verification (RANSAC — conditional) ─────────────────
+    if args.use_ransac and candidates:
+        from .geometric_verifier import GeometricVerifier
+        verifier = GeometricVerifier(
+            device=device,
+            logistic_w=args.ransac_logistic_w,
+            logistic_b=args.ransac_logistic_b,
+            min_confidence=args.ransac_min_confidence,
+        )
+        geom = verifier.verify(image_path, candidates)
+        top = candidates[0]
+        top.ransac_inliers = geom.inlier_count
+        top.geom_confidence = geom.confidence
+        if geom.triggered:
+            top.geom_verified = not geom.kill_switch
+
     # ── Print results ─────────────────────────────────────────────────
     _print_results(image_path, candidates, use_ocr=args.use_ocr)
+
+    if args.use_ransac and candidates and candidates[0].geom_verified is False:
+        print(
+            "\n[!] KILL-SWITCH activated — P(correct) below threshold.\n"
+            "    The system abstains: no GPS coordinate is emitted.\n"
+            "    (Reason: local geometric evidence insufficient to trust this prediction.)"
+        )
 
 
 def _print_results(
@@ -389,6 +413,12 @@ def _print_results(
                 f"(conf={c.text_confidence:.2f}, α={c.alpha_used:.2f})"
             )
         print(f"       Fused score  : {c.fused_score:.4f}")
+        if c.geom_verified is not None:
+            gstatus = "VALIDATED" if c.geom_verified else "REJECTED [kill-switch]"
+            print(
+                f"       Geom verify  : {gstatus} "
+                f"(inliers={c.ransac_inliers}, P={c.geom_confidence:.3f})"
+            )
         print(f"       Maps         : https://maps.google.com/?q={c.lat:.6f},{c.lon:.6f}")
         print(f"       DB image     : {c.db_image_path.name}")
         print("-" * 80)
@@ -494,6 +524,26 @@ def build_parser() -> argparse.ArgumentParser:
     infer_p.add_argument(
         "--zone", default="Paris, France",
         help="Human-readable zone description passed to the LLM prompt.",
+    )
+    infer_p.add_argument(
+        "--use-ransac", action="store_true",
+        help=(
+            "Enable conditional RANSAC geometric verification (Sferrazza et al., CVPR 2025). "
+            "Triggered only when late-fusion confidence is ambiguous. "
+            "Never re-ranks candidates — only validates the top-1 prediction."
+        ),
+    )
+    infer_p.add_argument(
+        "--ransac-min-confidence", type=float, default=0.5,
+        help="Kill-switch threshold: P(correct) below this → abstain (no GPS emitted).",
+    )
+    infer_p.add_argument(
+        "--ransac-logistic-w", type=float, default=0.05,
+        help="Logistic slope w in P(correct) = σ(w·i_q + b).",
+    )
+    infer_p.add_argument(
+        "--ransac-logistic-b", type=float, default=-2.0,
+        help="Logistic intercept b in P(correct) = σ(w·i_q + b). Default: ~40 inliers → 50%%.",
     )
     infer_p.set_defaults(func=cmd_infer)
 

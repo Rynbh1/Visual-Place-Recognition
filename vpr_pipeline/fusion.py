@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from .retrieval import MegaLocRetriever
 from .ocr import SceneTextExtractor, OllamaGeoFilter
@@ -51,6 +52,10 @@ class RetrievalCandidate:
     fused_score: float = 0.0
     alpha_used: float = 1.0
     extracted_texts: list[str] = field(default_factory=list)
+    # Populated by GeometricVerifier when triggered (None = not run).
+    ransac_inliers: int = 0
+    geom_confidence: float = 0.0
+    geom_verified: Optional[bool] = None
 
 
 class LateFusionOrchestrator:
