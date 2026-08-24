@@ -37,6 +37,13 @@ from typing import Optional
 import pandas as pd
 import torch
 
+# Allow running this file directly (`python vpr_pipeline/main.py ...`) in
+# addition to `python -m vpr_pipeline`: without a parent package, the relative
+# imports below would fail.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "vpr_pipeline"
+
 
 # ---------------------------------------------------------------------------
 # Dataset helpers
@@ -180,7 +187,7 @@ def compute_recall(
 
 def cmd_eval(args: argparse.Namespace) -> None:
     """Evaluate Recall@1/5/10 on a GSV-Cities structured dataset."""
-    from .retrieval import MegaLocRetriever
+    from retrieval import MegaLocRetriever
 
     dataset_path = Path(args.dataset_path)
     weights_path = Path(args.weights_path_megaloc)
@@ -281,11 +288,24 @@ def cmd_infer(args: argparse.Namespace) -> None:
         if not csv_files:
             raise FileNotFoundError(f"No CSV files found in: {df_dir}")
         train_files = [f for f in csv_files if f.name.endswith("_train.csv")]
-        full_files = [f for f in csv_files if not f.name.endswith("_train.csv") and not f.name.endswith("_test.csv")]
-        if train_files:
-            csv_path = train_files[0]
-        elif full_files:
+        test_files = [f for f in csv_files if f.name.endswith("_test.csv")]
+        full_files = [f for f in csv_files if f not in train_files and f not in test_files]
+        # A single-photo "where was this taken" query should search the whole known
+        # catalogue, not a training-only partition. train/test are a strict split of
+        # the full CSV built for evaluation (holding out test data to measure
+        # generalisation) — that split is meaningless for inference, and preferring
+        # train here made real queries unfindable whenever their true place happened
+        # to fall in the held-out test block (fixed after such a case: MegaLoc's own
+        # infer_megaloc.py defaults to the test split instead, so the two tools were
+        # silently searching two disjoint databases with no overlap between them).
+        if full_files:
             csv_path = full_files[0]
+        elif train_files:
+            csv_path = train_files[0]
+            print(f"[infer] Warning: no full (unsplit) CSV found in {df_dir} — falling back to "
+                  f"the train split. Places held out in the test split will never be found.")
+        elif test_files:
+            csv_path = test_files[0]
         else:
             csv_path = csv_files[0]
 
@@ -445,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the MegaLoc .pth checkpoint.",
     )
     shared.add_argument(
-        "--weights-path-textinplace", default="/TextInPlace/repo/checkpoints/best_model.pth",
+        "--weights-path-textinplace", default="TextInPlace/weights/textinplace_finetuned.pth",
         help="Path to the TextInPlace .pth checkpoint.",
     )
     shared.add_argument(

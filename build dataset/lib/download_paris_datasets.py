@@ -54,10 +54,12 @@ def _ms_download_one(key, out_dir):
     if dest.exists() and dest.stat().st_size > 0:
         return 0
     try:
-        r = requests.get(f"{MS_BASE}/{quote(key, safe='/')}", timeout=120)
+        r = requests.get(f"{MS_BASE}/images/{quote(key, safe='/')}", timeout=120)
         r.raise_for_status()
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(r.content)
+        temp_path = dest.with_suffix(dest.suffix + ".tmp")
+        temp_path.write_bytes(r.content)
+        temp_path.rename(dest)
         return 1
     except requests.RequestException:
         return 0

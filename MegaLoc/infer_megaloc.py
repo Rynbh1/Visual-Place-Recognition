@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 import sys
 import os
+from pathlib import Path
 import torch
 import pandas as pd
 import numpy as np
 import torchvision.transforms as T
 from PIL import Image, ImageDraw, ImageFont
-from tqdm import tqdm
 
 # Add local path for sub-modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo"))
 from lib.megaloc_model import MegaLoc
+from lib.gsv_cities import discover_csvs, resolve_image_path
+from lib.descriptor_cache import DescriptorCache
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MegaLoc Single-Image Inference Script")
     parser.add_argument("--query-image", type=str, required=True,
                         help="Path to the query photo to search for")
-    parser.add_argument("--weights-path", type=str, default="megaloc_finetuned_paris.pth",
+    parser.add_argument("-w", "--weights", type=str, default="megaloc_finetuned_paris.pth",
                         help="Path to the model weights file")
-    parser.add_argument("--db-csv", type=str,
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
-                        help="Path to the test/database CSV file to build reference database")
-    parser.add_argument("--img-dir", type=str,
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
-                        help="Path to the database images directory")
+    parser.add_argument("--dataset_root", type=str, nargs="+",
+                        default=["/media/rayan/usb/VPR Dataset/paris/gsv_cities"],
+                        help="Un ou plusieurs dossiers au format GSV-Cities "
+                        "(Dataframes/<Ville>.csv + Images/<Ville>/) utilises pour "
+                        "construire la base de reference (split test si present).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,7 +38,7 @@ def main():
         return
 
     # Load model
-    weights_path = args.weights_path
+    weights_path = args.weights
     if not os.path.exists(weights_path):
         if os.path.exists(os.path.join("MegaLoc", weights_path)):
             weights_path = os.path.join("MegaLoc", weights_path)
@@ -51,18 +52,37 @@ def main():
     model = model.to(device)
     model.eval()
 
-    # Load database images from CSV
-    if not os.path.exists(args.db_csv):
-        print(f"Error: Database CSV '{args.db_csv}' not found.")
-        return
+    # Discover database CSVs across one or more GSV-Cities dataset roots.
+    # split=None -> prefer the full, unsplit <City>.csv. A single-photo "where was this
+    # taken" query should search the whole known catalogue, not the held-out test slice
+    # (train/test are a partition built for evaluation, not for inference coverage: on
+    # this dataset train and test cover disjoint, non-overlapping places, so split="test"
+    # made every place from the other 80% of the catalogue permanently unfindable here).
+    dataset_specs = []
+    for root in args.dataset_root:
+        specs = discover_csvs(root, split=None)
+        if not specs:
+            print(f"Error: no CSV found under {root}/Dataframes")
+            return
+        dataset_specs.extend(specs)
 
-    df = pd.read_csv(args.db_csv)
-    # Group by place_id and take first image of each place as reference
+    # Group by (source_idx, place_id) and take first image of each place as reference,
+    # so place_ids from different sources never collide.
+    #
+    # Sort deterministically before grouping (place_id, year, month, northdeg, panoid):
+    # pandas' groupby keeps each group's rows in on-disk CSV order, which is *not*
+    # guaranteed to match vpr_pipeline's own reference-image pick for the same
+    # place_id (vpr_pipeline/main.py's _load_entries_from_csv() sorts first). Without
+    # this, the two tools can silently compare a query against two different photos
+    # of the very same place and disagree on the top-1 answer even when searching an
+    # identical, fully-overlapping database.
     db_rows = []
-    for pid, group in df.groupby("place_id"):
-        db_rows.append(group.iloc[0])
-    db_df = pd.DataFrame(db_rows)
-    print(f"Reference database built with {len(db_df)} locations.")
+    for source_idx, (csv_path, img_dir) in enumerate(dataset_specs):
+        df = pd.read_csv(csv_path, dtype={"panoid": str})
+        df = df.sort_values(by=["place_id", "year", "month", "northdeg", "panoid"]).reset_index(drop=True)
+        for pid, group in df.groupby("place_id"):
+            db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
+    print(f"Reference database built with {len(db_rows)} locations.")
 
     # Image transformations
     val_transform = T.Compose([
@@ -71,33 +91,32 @@ def main():
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    def get_filename(r):
-        return f"{r['city_id']}_{r['place_id']:07d}_{r['year']:04d}_{r['month']:02d}_{r['northdeg']:03d}_{r['lat']:.7f}_{r['lon']:.7f}_{r['panoid']}.jpg"
-
     # Pre-extract database descriptors
     db_places = []
     db_paths = []
     db_coords = []
-    db_descriptors = []
-    
-    print("Extracting reference database descriptors...")
-    with torch.no_grad():
-        for _, row in tqdm(db_df.iterrows(), total=len(db_df)):
-            fname = get_filename(row)
-            path = os.path.join(args.img_dir, row['city_id'], fname)
-            if not os.path.exists(path):
-                continue
-            
-            img = Image.open(path).convert("RGB")
-            tensor = val_transform(img).unsqueeze(0).to(device)
-            desc = model(tensor).cpu().numpy().flatten()
-            
-            db_places.append(row['place_id'])
-            db_paths.append(path)
-            db_coords.append((row['lat'], row['lon']))
-            db_descriptors.append(desc)
 
-    db_matrix = np.array(db_descriptors)
+    for source_idx, pid, img_dir, row in db_rows:
+        path = resolve_image_path(img_dir, row)
+        if path is None:
+            continue
+        db_places.append((source_idx, pid))
+        db_paths.append(path)
+        db_coords.append((row['lat'], row['lon']))
+
+    # Descriptors are cached on disk per (weights, image) pair and shared with
+    # vpr_pipeline and evaluate_vpr.ipynb — re-encoding the whole ~20k-image
+    # catalogue (~11-12 min) only happens once per weights checkpoint, not once
+    # per script invocation.
+    @torch.no_grad()
+    def encode_fn(path):
+        img = Image.open(path).convert("RGB")
+        tensor = val_transform(img).unsqueeze(0).to(device)
+        return model(tensor).cpu().numpy().flatten()
+
+    print("Extracting reference database descriptors...")
+    cache = DescriptorCache(Path(weights_path))
+    db_matrix = cache.get_or_encode(db_paths, encode_fn, desc="Encoding database")
     if len(db_matrix) == 0:
         print("Error: No database descriptors could be extracted.")
         return

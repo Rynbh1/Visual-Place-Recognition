@@ -10,12 +10,14 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 # Add local path for sub-modules
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 repo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo")
 sys.path.append(repo_path)
 sys.path.append(os.path.join(repo_path, "detectron2"))
 
 from network import STVGLNet_test
 from backbone import setup_cfg
+from lib.gsv_cities import discover_csvs, resolve_image_path
 
 # Vocabulary for decoding text predictions
 voc = list(string.printable[:-6])
@@ -46,38 +48,6 @@ def get_detected_text(predictions):
         rec_strings.append(rec_decode(rec))
     return rec_strings
 
-def get_image_path(row, img_dir):
-    city = row['city_id']
-    place_id = int(row['place_id'])
-    
-    # Extract year, month, northdeg, lat, lon, panoid
-    year = str(row['year']).zfill(4)
-    month = str(row['month']).zfill(2)
-    northdeg = str(row['northdeg']).zfill(3)
-    lat, lon = f"{row['lat']:.7f}", f"{row['lon']:.7f}"
-    
-    value = row['panoid']
-    if isinstance(value, float) and value.is_integer():
-        panoid = str(int(value))
-    else:
-        panoid = str(value)
-
-    # Pattern 1: Paris75018 / Paris75019 dataset format (with % 10**5 and 7-digit place_id)
-    pl_id = place_id % 10**5
-    pl_id_str = str(pl_id).zfill(7)
-    name1 = f"{city}_{pl_id_str}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
-    path1 = os.path.join(img_dir, city, name1)
-    if os.path.exists(path1):
-        return path1
-
-    # Pattern 2: MegaLoc/Standard GSV format (direct 7-digit place_id)
-    name2 = f"{city}_{place_id:07d}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
-    path2 = os.path.join(img_dir, city, name2)
-    if os.path.exists(path2):
-        return path2
-
-    return None
-
 def normalize_desc(desc):
     norm = np.linalg.norm(desc)
     if norm == 0:
@@ -95,12 +65,11 @@ def main():
                         help="Path to the query photo to search for")
     parser.add_argument("--weights-path", type=str, default=default_weights,
                         help="Path to the model weights file")
-    parser.add_argument("--db-csv", type=str,
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
-                        help="Path to the test/database CSV file to build reference database")
-    parser.add_argument("--img-dir", type=str,
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
-                        help="Path to the database images directory")
+    parser.add_argument("--dataset_root", type=str, nargs="+",
+                        default=["/media/rayan/usb/VPR Dataset/paris/gsv_cities"],
+                        help="Un ou plusieurs dossiers au format GSV-Cities "
+                        "(Dataframes/<Ville>.csv + Images/<Ville>/) utilises pour "
+                        "construire la base de reference (split test si present).")
     parser.add_argument("--config-file", type=str,
                         default=default_config,
                         help="Path to Detectron2/AdelaiDet config file")
@@ -178,17 +147,22 @@ def main():
     model.eval()
 
     # Load database images from CSV
-    if not os.path.exists(args.db_csv):
-        print(f"Error: Database CSV '{args.db_csv}' not found.")
-        return
+    dataset_specs = []
+    for root in args.dataset_root:
+        specs = discover_csvs(root, split="test")
+        if not specs:
+            print(f"Error: no CSV found under {root}/Dataframes")
+            return
+        dataset_specs.extend(specs)
 
-    df = pd.read_csv(args.db_csv)
-    # Group by place_id and take first image of each place as reference
+    # Group by (source_idx, place_id) and take first image of each place as reference,
+    # so place_ids from different sources never collide.
     db_rows = []
-    for pid, group in df.groupby("place_id"):
-        db_rows.append(group.iloc[0])
-    db_df = pd.DataFrame(db_rows)
-    print(f"Reference database built with {len(db_df)} locations.")
+    for source_idx, (csv_path, img_dir) in enumerate(dataset_specs):
+        df = pd.read_csv(csv_path, dtype={"panoid": str})
+        for pid, group in df.groupby("place_id"):
+            db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
+    print(f"Reference database built with {len(db_rows)} locations.")
 
     # Image transformations
     val_transform = T.Compose([
@@ -206,25 +180,25 @@ def main():
     
     print("Extracting reference database descriptors and scene texts...")
     with torch.no_grad():
-        for _, row in tqdm(db_df.iterrows(), total=len(db_df)):
-            path = get_image_path(row, args.img_dir)
-            if path is None or not os.path.exists(path):
+        for source_idx, pid, img_dir, row in tqdm(db_rows, total=len(db_rows)):
+            path = resolve_image_path(img_dir, row)
+            if path is None:
                 continue
-            
+
             img = Image.open(path).convert("RGB")
             tensor = val_transform(img).unsqueeze(0).to(device)
-            
+
             # Forward pass to get text spotting predictions and features
             predictions, frozen_features = model(tensor)
-            
+
             # VPR descriptor extraction
             desc = model.vpr_branch(frozen_features).cpu().numpy().flatten()
             desc = normalize_desc(desc)
-            
+
             # Decode scene text
             detected_words = get_detected_text(predictions)
-            
-            db_places.append(row['place_id'])
+
+            db_places.append((source_idx, pid))
             db_paths.append(path)
             db_coords.append((row['lat'], row['lon']))
             db_descriptors.append(desc)

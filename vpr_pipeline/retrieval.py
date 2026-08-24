@@ -19,7 +19,6 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image
-from tqdm import tqdm
 
 try:
     import faiss
@@ -34,6 +33,7 @@ if str(_MEGALOC_ROOT) not in sys.path:
     sys.path.insert(0, str(_MEGALOC_ROOT))
 
 from lib.megaloc_model import MegaLoc  # noqa: E402  (import after sys.path patch)
+from lib.descriptor_cache import DescriptorCache  # noqa: E402
 
 # Standard ImageNet normalisation used during MegaLoc training
 _TRANSFORM = T.Compose([
@@ -126,6 +126,10 @@ class MegaLocRetriever:
             index_cache: Optional .faiss file. If it exists the index is loaded
                          from disk instead of re-encoding (speeds up repeated runs).
                          If it does not exist the index is saved there after build.
+                         Note this only caches the FAISS index itself, with no record
+                         of which weights/images built it — it's an opt-in, exact-match
+                         shortcut on top of the descriptor cache below, not a substitute
+                         for it (delete the file if the dataset or weights change).
         """
         if index_cache is not None and Path(index_cache).exists():
             self._index = faiss.read_index(str(index_cache))
@@ -136,9 +140,13 @@ class MegaLocRetriever:
         self._load_model()
         feat_dim: int = self._model.feat_dim
 
-        descriptors = np.empty((len(db_entries), feat_dim), dtype="float32")
-        for i, entry in enumerate(tqdm(db_entries, desc="Encoding database", ncols=80)):
-            descriptors[i] = self._encode(Path(entry["path"]))
+        # Per-image descriptors are cached on disk keyed by (weights, image path +
+        # mtime), shared with infer_megaloc.py and evaluate_vpr.ipynb — re-encoding
+        # the whole catalogue only happens once per weights checkpoint, not once per
+        # process, whichever of the three tools runs first.
+        cache = DescriptorCache(self.weights_path)
+        paths = [entry["path"] for entry in db_entries]
+        descriptors = cache.get_or_encode(paths, self._encode, desc="Encoding database")
 
         # IndexFlatIP = exact cosine similarity search on L2-normalised vectors
         index = faiss.IndexFlatIP(feat_dim)

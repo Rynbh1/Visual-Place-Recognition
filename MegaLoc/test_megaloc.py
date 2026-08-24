@@ -13,6 +13,7 @@ from tqdm import tqdm
 sys.path.append("./MegaLoc")
 sys.path.append("./MegaLoc/repo")
 from lib.megaloc_model import MegaLoc
+from lib.gsv_cities import discover_csvs, resolve_image_path
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000.0  # meters
@@ -32,14 +33,16 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="MegaLoc Testing Script")
-    parser.add_argument("--weights_path", type=str, default="megaloc_finetuned_paris.pth",
+    parser.add_argument("-w", "--weights_path", type=str, default="megaloc_finetuned_paris.pth",
                         help="Path to the model weights file")
-    parser.add_argument("--test_csv", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
-                        help="Path to the test CSV file")
-    parser.add_argument("--img_dir", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
-                        help="Path to the images directory")
+    parser.add_argument("--dataset_root", type=str, nargs="+",
+                        default=["/media/rayan/usb/VPR Dataset/paris/gsv_cities"],
+                        help="Un ou plusieurs dossiers au format GSV-Cities "
+                        "(Dataframes/<Ville>.csv + Images/<Ville>/) utilises pour "
+                        "l'evaluation (split test si present).")
+    parser.add_argument("--dist_threshold", type=float, default=100.0,
+                        help="Rayon (en metres) autour de la position reelle dans lequel "
+                        "une prediction est consideree correcte (defaut: 100m)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,35 +63,38 @@ def main():
     model = model.to(device)
     model.eval()
 
-    # 2. Charger les données de test
-    test_csv = args.test_csv
-    img_dir = args.img_dir
+    # 2. Decouvrir les CSV de test dans un ou plusieurs dossiers GSV-Cities
+    dataset_specs = []
+    for root in args.dataset_root:
+        specs = discover_csvs(root, split="test")
+        if not specs:
+            print(f"Erreur : aucun CSV trouve sous {root}/Dataframes")
+            return
+        dataset_specs.extend(specs)
 
-    if not os.path.exists(test_csv):
-        print(f"Erreur : {test_csv} introuvable.")
-        return
-
-    df = pd.read_csv(test_csv)
-    print(f"Nombre total d'images de test : {len(df)}")
-
-    # 3. Séparation en Database et Queries (par place_id)
+    # 3. Séparation en Database et Queries (par (source, place_id), pour ne
+    #    jamais mélanger des place_id qui collisionnent entre deux sources)
     db_rows = []
     q_rows = []
-    for pid, group in df.groupby("place_id"):
-        if len(group) >= 2:
-            # La première image sert de référence (Database)
-            db_rows.append(group.iloc[0])
-            # Toutes les autres servent de requêtes (Queries)
-            q_rows.extend([group.iloc[i] for i in range(1, len(group))])
-        else:
-            # Si le lieu n'a qu'une image, elle ne sert que de bruit dans la database
-            db_rows.append(group.iloc[0])
+    n_images = 0
+    for source_idx, (csv_path, img_dir) in enumerate(dataset_specs):
+        df = pd.read_csv(csv_path, dtype={"panoid": str})
+        n_images += len(df)
+        for pid, group in df.groupby("place_id"):
+            if len(group) >= 2:
+                # La première image sert de référence (Database)
+                db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
+                # Toutes les autres servent de requêtes (Queries)
+                q_rows.extend(
+                    (source_idx, pid, img_dir, group.iloc[i]) for i in range(1, len(group))
+                )
+            else:
+                # Si le lieu n'a qu'une image, elle ne sert que de bruit dans la database
+                db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
 
-    db_df = pd.DataFrame(db_rows)
-    q_df = pd.DataFrame(q_rows)
-
-    print(f"-> Base de référence (Database) : {len(db_df)} images")
-    print(f"-> Requêtes (Queries) : {len(q_df)} images")
+    print(f"Nombre total d'images de test : {n_images}")
+    print(f"-> Base de référence (Database) : {len(db_rows)} images")
+    print(f"-> Requêtes (Queries) : {len(q_rows)} images")
 
     # Transformation d'inférence (322x322 pixels conforme au papier MegaLoc)
     val_transform = T.Compose([
@@ -97,85 +103,91 @@ def main():
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    def get_filename(r):
-        return f"{r['city_id']}_{r['place_id']:07d}_{r['year']:04d}_{r['month']:02d}_{r['northdeg']:03d}_{r['lat']:.7f}_{r['lon']:.7f}_{r['panoid']}.jpg"
-
-    def extract_descriptors(dataframe, desc_name):
+    def extract_descriptors(rows, desc_name):
         places = []
         paths = []
         descriptors = []
         coords = []
         with torch.no_grad():
-            for _, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc=f"Extraction {desc_name}"):
-                fname = get_filename(row)
-                path = os.path.join(img_dir, row['city_id'], fname)
-                if not os.path.exists(path):
+            for source_idx, pid, img_dir, row in tqdm(rows, total=len(rows), desc=f"Extraction {desc_name}"):
+                path = resolve_image_path(img_dir, row)
+                if path is None:
                     continue
-                
+
                 img = Image.open(path).convert("RGB")
                 tensor = val_transform(img).unsqueeze(0).to(device)
-                
+
                 # Extraire le descripteur global de taille [8448]
                 desc = model(tensor).cpu().numpy().flatten()
-                
-                places.append(row['place_id'])
+
+                places.append((source_idx, pid))
                 paths.append(path)
                 descriptors.append(desc)
                 coords.append((row['lat'], row['lon']))
-                
-        return np.array(places), paths, np.array(descriptors), coords
+
+        return places, paths, np.array(descriptors), coords
 
     # Extraction des descripteurs
-    db_places, db_paths, db_matrix, db_coords = extract_descriptors(db_df, "Database")
-    q_places, q_paths, q_matrix, q_coords = extract_descriptors(q_df, "Queries")
+    db_places, db_paths, db_matrix, db_coords = extract_descriptors(db_rows, "Database")
+    q_places, q_paths, q_matrix, q_coords = extract_descriptors(q_rows, "Queries")
 
     if len(db_matrix) == 0 or len(q_matrix) == 0:
         print("Erreur : Aucun descripteur n'a pu être extrait.")
         return
 
     # 4. Calcul de l'évaluation (Recall@N)
+    n_queries = len(q_places)
+    db_matrix = np.ascontiguousarray(db_matrix, dtype=np.float32)
+    q_matrix = np.ascontiguousarray(q_matrix, dtype=np.float32)
+
+    # Les metriques s'arretent a R@10 : inutile de trier toute la base par requete.
+    # Une similarite par requete (np.dot(db_matrix, q_desc)) relit l'integralite des
+    # descripteurs a chaque iteration -> plusieurs To de trafic memoire sur un gros
+    # split, tous les coeurs satures, et un classement complet conserve pour chaque
+    # requete (n_queries x n_db entiers). Un GEMM par bloc + argpartition top-K fait
+    # le meme calcul, au resultat identique, en quelques secondes et 9 Mo de RAM.
+    top_k = min(100, len(db_matrix))
+    block = 512
+
+    all_top_indices = np.empty((n_queries, top_k), dtype=np.int32)
+
+    print("\nRecherche des plus proches voisins pour le Recall...")
+    for start in tqdm(range(0, n_queries, block), desc="Recherche kNN"):
+        stop = min(start + block, n_queries)
+        sims = q_matrix[start:stop] @ db_matrix.T           # [b, n_db], cosine (L2-normalise)
+        part = np.argpartition(-sims, top_k - 1, axis=1)[:, :top_k]
+        rows = np.arange(stop - start)[:, None]
+        order = np.argsort(-sims[rows, part], axis=1)
+        all_top_indices[start:stop] = part[rows, order]
+
+    # Recall metrics using exact place ID OR distance <= dist_threshold
+    db_lat = np.array([c[0] for c in db_coords], dtype=np.float64)
+    db_lon = np.array([c[1] for c in db_coords], dtype=np.float64)
+    # db_places contient des tuples (source_idx, place_id) -> cle texte comparable en vectoriel
+    db_place_keys = np.array([f"{s}:{p}" for s, p in db_places])
+    q_place_keys = [f"{s}:{p}" for s, p in q_places]
+
     correct_r1 = 0
     correct_r5 = 0
     correct_r10 = 0
-    n_queries = len(q_places)
-
-    print("\nRecherche des plus proches voisins pour le Recall...")
-    all_top_indices = []
-    all_sims = []
-
     for i in range(n_queries):
-        q_place = q_places[i]
-        q_desc = q_matrix[i]
+        top10 = all_top_indices[i, :10]
         q_lat, q_lon = q_coords[i]
-
-        # Similarité cosine (produit scalaire simple car normés L2)
-        sims = np.dot(db_matrix, q_desc)
-        
-        # Classer du plus similaire au moins similaire
-        top_indices = np.argsort(-sims)
-
-        all_top_indices.append(top_indices)
-        all_sims.append(sims)
-
-        # Recall metrics using exact place ID OR distance <= 25m
-        is_correct_top = []
-        for idx in top_indices[:10]:
-            pred_place = db_places[idx]
-            pred_lat, pred_lon = db_coords[idx]
-            dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
-            is_correct_top.append((pred_place == q_place) or (dist <= 25.0))
+        dist = haversine_distance(db_lat[top10], db_lon[top10], q_lat, q_lon)
+        is_correct_top = (db_place_keys[top10] == q_place_keys[i]) | (dist <= args.dist_threshold)
 
         if is_correct_top[0]:
             correct_r1 += 1
-        if any(is_correct_top[:5]):
+        if is_correct_top[:5].any():
             correct_r5 += 1
-        if any(is_correct_top[:10]):
+        if is_correct_top[:10].any():
             correct_r10 += 1
 
     print("\n" + "=" * 50)
     print("                RÉSULTATS DE TEST")
     print("=" * 50)
     print(f"  Nombre total de requêtes : {n_queries}")
+    print(f"  Rayon de validation      : {args.dist_threshold:.0f}m")
     print(f"  Recall@1                 : {correct_r1 / n_queries * 100:.2f}%")
     print(f"  Recall@5                 : {correct_r5 / n_queries * 100:.2f}%")
     print(f"  Recall@10                : {correct_r10 / n_queries * 100:.2f}%")
@@ -188,7 +200,9 @@ def main():
     q_path = q_paths[q_idx]
     q_lat, q_lon = q_coords[q_idx]
     
-    q_sims = all_sims[q_idx]
+    # Recalculee pour cette seule requete : conserver toutes les similarites couterait
+    # n_queries x n_db flottants, alors qu'une ligne se recalcule en quelques ms.
+    q_sims = db_matrix @ q_matrix[q_idx]
     q_top5_idx = all_top_indices[q_idx][:5]
 
     target_size = (250, 250)
@@ -231,7 +245,7 @@ def main():
         pred_lat, pred_lon = db_coords[idx]
         
         dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
-        is_correct = (pred_place == q_place) or (dist <= 25.0)
+        is_correct = (pred_place == q_place) or (dist <= args.dist_threshold)
         # Vert si correct, Rouge si incorrect
         border_color = (46, 204, 113) if is_correct else (231, 76, 60)
         

@@ -40,6 +40,7 @@ def make_progress_bar(percentage, width=20):
     return bar
 
 
+
 def extract_zip(args):
     zip_path, output_dir, show_progress = args
     stem = zip_path.stem
@@ -145,8 +146,8 @@ def main():
     parser.add_argument(
         "source_dirs",
         nargs="*",
-        default=["/media/rayan/usb/osv5m/images/train",
-                 "/media/rayan/usb/osv5m/images/cloud"],
+        default=["/media/rayan/usb1/osv5m/images/train",
+                 "/media/rayan/usb1/osv5m/images/cloud"],
         help="Directories containing zip files (default: train + cloud)",
     )
     parser.add_argument(

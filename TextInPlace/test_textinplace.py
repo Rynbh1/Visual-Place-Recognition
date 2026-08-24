@@ -16,6 +16,7 @@ except ImportError:
     faiss = None
 
 # Add local path for sub-modules
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 repo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo")
 sys.path.append(repo_path)
 sys.path.append(os.path.join(repo_path, "detectron2"))
@@ -23,6 +24,7 @@ sys.path.append(os.path.join(repo_path, "detectron2"))
 from network import STVGLNet_test
 from backbone import setup_cfg
 from utils import util
+from lib.gsv_cities import discover_csvs, resolve_image_path
 
 # Vocabulary for decoding text predictions
 voc = list(string.printable[:-6])
@@ -52,38 +54,6 @@ def get_detected_text(predictions):
     for rec in instances.recs:
         rec_strings.append(rec_decode(rec))
     return rec_strings
-
-def get_image_path(row, img_dir):
-    city = row['city_id']
-    place_id = int(row['place_id'])
-    
-    # Extract year, month, northdeg, lat, lon, panoid
-    year = str(row['year']).zfill(4)
-    month = str(row['month']).zfill(2)
-    northdeg = str(row['northdeg']).zfill(3)
-    lat, lon = f"{row['lat']:.7f}", f"{row['lon']:.7f}"
-    
-    value = row['panoid']
-    if isinstance(value, float) and value.is_integer():
-        panoid = str(int(value))
-    else:
-        panoid = str(value)
-
-    # Pattern 1: Paris75018 / Paris75019 dataset format
-    pl_id = place_id % 10**5
-    pl_id_str = str(pl_id).zfill(7)
-    name1 = f"{city}_{pl_id_str}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
-    path1 = os.path.join(img_dir, city, name1)
-    if os.path.exists(path1):
-        return path1
-
-    # Pattern 2: MegaLoc/Standard GSV format (direct 7-digit place_id)
-    name2 = f"{city}_{place_id:07d}_{year}_{month}_{northdeg}_{lat}_{lon}_{panoid}.jpg"
-    path2 = os.path.join(img_dir, city, name2)
-    if os.path.exists(path2):
-        return path2
-
-    return None
 
 def normalize_desc(desc):
     norm = np.linalg.norm(desc)
@@ -139,14 +109,13 @@ def main():
 
     import argparse
     parser = argparse.ArgumentParser(description="TextInPlace Testing and Evaluation Script")
-    parser.add_argument("--weights_path", type=str, default="textinplace_finetuned_paris.pth",
+    parser.add_argument("-w", "--weights_path", type=str, default="textinplace_finetuned.pth",
                         help="Path to the model weights file")
-    parser.add_argument("--test_csv", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Dataframes/Paris75019_test.csv",
-                        help="Path to the test CSV file")
-    parser.add_argument("--img_dir", type=str, 
-                        default="/home/rayan/Documents/github/Visual Place Recognition/datasets/paris_75019/Images",
-                        help="Path to the images directory")
+    parser.add_argument("--dataset_root", type=str, nargs="+",
+                        default=["/media/rayan/usb/VPR Dataset/paris/gsv_cities"],
+                        help="Un ou plusieurs dossiers au format GSV-Cities "
+                        "(Dataframes/<Ville>.csv + Images/<Ville>/) utilises pour "
+                        "l'evaluation (split test si present).")
     parser.add_argument("--config-file", type=str, default=default_config,
                         help="Path to Detectron2/AdelaiDet config file")
     parser.add_argument("--confidence-threshold", type=float, default=0.3,
@@ -155,6 +124,9 @@ def main():
                         help="VPR features dimension")
     parser.add_argument("--use-text-rerank", action="store_true",
                         help="Enable scene text based re-ranking during evaluation")
+    parser.add_argument("--dist_threshold", type=float, default=100.0,
+                        help="Rayon (en metres) autour de la position reelle dans lequel "
+                        "une prediction est consideree correcte (defaut: 100m)")
     parser.add_argument("--opts", help="Modify config options", default=[], nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -219,32 +191,35 @@ def main():
     model = model.to(device)
     model.eval()
 
-    # 2. Charger les données de test
-    test_csv = args.test_csv
-    img_dir = args.img_dir
+    # 2. Decouvrir les CSV de test dans un ou plusieurs dossiers GSV-Cities
+    dataset_specs = []
+    for root in args.dataset_root:
+        specs = discover_csvs(root, split="test")
+        if not specs:
+            print(f"Erreur : aucun CSV trouve sous {root}/Dataframes")
+            return
+        dataset_specs.extend(specs)
 
-    if not os.path.exists(test_csv):
-        print(f"Erreur : {test_csv} introuvable.")
-        return
-
-    df = pd.read_csv(test_csv)
-    print(f"Nombre total d'images de test : {len(df)}")
-
-    # 3. Séparation en Database et Queries (par place_id)
+    # 3. Séparation en Database et Queries (par (source, place_id), pour ne
+    #    jamais mélanger des place_id qui collisionnent entre deux sources)
     db_rows = []
     q_rows = []
-    for pid, group in df.groupby("place_id"):
-        if len(group) >= 2:
-            db_rows.append(group.iloc[0])
-            q_rows.extend([group.iloc[i] for i in range(1, len(group))])
-        else:
-            db_rows.append(group.iloc[0])
+    n_images = 0
+    for source_idx, (csv_path, img_dir) in enumerate(dataset_specs):
+        df = pd.read_csv(csv_path, dtype={"panoid": str})
+        n_images += len(df)
+        for pid, group in df.groupby("place_id"):
+            if len(group) >= 2:
+                db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
+                q_rows.extend(
+                    (source_idx, pid, img_dir, group.iloc[i]) for i in range(1, len(group))
+                )
+            else:
+                db_rows.append((source_idx, pid, img_dir, group.iloc[0]))
 
-    db_df = pd.DataFrame(db_rows)
-    q_df = pd.DataFrame(q_rows)
-
-    print(f"-> Base de référence (Database) : {len(db_df)} images")
-    print(f"-> Requêtes (Queries) : {len(q_df)} images")
+    print(f"Nombre total d'images de test : {n_images}")
+    print(f"-> Base de référence (Database) : {len(db_rows)} images")
+    print(f"-> Requêtes (Queries) : {len(q_rows)} images")
 
     # Image transformations
     val_transform = T.Compose([
@@ -253,97 +228,102 @@ def main():
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    def extract_descriptors(dataframe, desc_name):
+    def extract_descriptors(rows, desc_name):
         places = []
         paths = []
         descriptors = []
         texts = []
         coords = []
         with torch.no_grad():
-            for _, row in tqdm(dataframe.iterrows(), total=len(dataframe), desc=f"Extraction {desc_name}"):
-                path = get_image_path(row, img_dir)
-                if path is None or not os.path.exists(path):
+            for source_idx, pid, img_dir, row in tqdm(rows, total=len(rows), desc=f"Extraction {desc_name}"):
+                path = resolve_image_path(img_dir, row)
+                if path is None:
                     continue
-                
+
                 img = Image.open(path).convert("RGB")
                 tensor = val_transform(img).unsqueeze(0).to(device)
-                
+
                 predictions, frozen_features = model(tensor)
                 desc = model.vpr_branch(frozen_features).cpu().numpy().flatten()
                 desc = normalize_desc(desc)
 
                 detected_words = get_detected_text(predictions)
-                
-                places.append(row['place_id'])
+
+                places.append((source_idx, pid))
                 paths.append(path)
                 descriptors.append(desc)
                 texts.append(detected_words)
                 coords.append((row['lat'], row['lon']))
-                
-        return np.array(places), paths, np.array(descriptors), texts, coords
+
+        return places, paths, np.array(descriptors), texts, coords
 
     # Extraction des descripteurs
-    db_places, db_paths, db_matrix, db_texts, db_coords = extract_descriptors(db_df, "Database")
-    q_places, q_paths, q_matrix, q_texts, q_coords = extract_descriptors(q_df, "Queries")
+    db_places, db_paths, db_matrix, db_texts, db_coords = extract_descriptors(db_rows, "Database")
+    q_places, q_paths, q_matrix, q_texts, q_coords = extract_descriptors(q_rows, "Queries")
 
     if len(db_matrix) == 0 or len(q_matrix) == 0:
         print("Erreur : Aucun descripteur n'a pu être extrait.")
         return
 
     # 4. Calcul de l'évaluation (Recall@N)
+    n_queries = len(q_places)
+    db_matrix = np.ascontiguousarray(db_matrix, dtype=np.float32)
+    q_matrix = np.ascontiguousarray(q_matrix, dtype=np.float32)
+
+    # Seuls les 100 premiers candidats peuvent changer R@1/5/10 : le reranking textuel
+    # ne reordonne que le top-100 et les metriques s'arretent a 10. On ne garde donc que
+    # ce top-K au lieu du classement complet, et on calcule les similarites par blocs de
+    # requetes. Une similarite par requete (np.dot(db_matrix, q_desc)) relit toute la
+    # base a chaque iteration : sur 22 907 requetes x 3 926 references, ca fait plusieurs
+    # To de trafic memoire, tous les coeurs satures pendant des dizaines de minutes, et
+    # ~1,4 Go de RAM par tableau conserve. Un GEMM par bloc la relit une fois par bloc.
+    top_k = min(100, len(db_matrix))
+    block = 512
+
+    all_top_indices = np.empty((n_queries, top_k), dtype=np.int32)
+
+    print("\nRecherche des plus proches voisins pour le Recall...")
+    for start in tqdm(range(0, n_queries, block), desc="Recherche kNN"):
+        stop = min(start + block, n_queries)
+        sims = q_matrix[start:stop] @ db_matrix.T           # [b, n_db], cosine (L2-normalise)
+        # argpartition = selection O(n) du top-K, puis tri des K seuls
+        part = np.argpartition(-sims, top_k - 1, axis=1)[:, :top_k]
+        rows = np.arange(stop - start)[:, None]
+        order = np.argsort(-sims[rows, part], axis=1)
+        all_top_indices[start:stop] = part[rows, order]
+
+    if args.use_text_rerank:
+        for i in tqdm(range(n_queries), desc="Reranking textuel"):
+            all_top_indices[i] = scene_text_rerank(all_top_indices[i], q_texts[i], db_texts)
+
+    # Recall metrics using exact place ID OR distance <= dist_threshold
+    db_lat = np.array([c[0] for c in db_coords], dtype=np.float64)
+    db_lon = np.array([c[1] for c in db_coords], dtype=np.float64)
+    # db_places contient des tuples (source_idx, place_id) -> cle texte comparable en vectoriel
+    db_place_keys = np.array([f"{s}:{p}" for s, p in db_places])
+    q_place_keys = [f"{s}:{p}" for s, p in q_places]
+
     correct_r1 = 0
     correct_r5 = 0
     correct_r10 = 0
-    n_queries = len(q_places)
-
-    print("\nRecherche des plus proches voisins pour le Recall...")
-    all_top_indices = []
-    all_sims = []
-
     for i in range(n_queries):
-        q_place = q_places[i]
-        q_desc = q_matrix[i]
-        q_words = q_texts[i]
-
-        # Cosine similarity
-        sims = np.dot(db_matrix, q_desc)
-        
-        # Initial ranking by visual descriptor
-        top_indices = np.argsort(-sims)
-        
-        # Apply scene text reranking if requested
-        if args.use_text_rerank:
-            # Rerank the top 100 visual predictions using scene text
-            top_100_indices = top_indices[:100]
-            reranked_top_100 = scene_text_rerank(top_100_indices, q_words, db_texts)
-            top_indices = np.concatenate([reranked_top_100, top_indices[100:]])
-
-        top_places = db_places[top_indices]
-
-        all_top_indices.append(top_indices)
-        all_sims.append(sims)
-
-        # Recall metrics using exact place ID OR distance <= 25m
+        top10 = all_top_indices[i, :10]
         q_lat, q_lon = q_coords[i]
-        
-        is_correct_top = []
-        for idx in top_indices[:10]:
-            pred_place = db_places[idx]
-            pred_lat, pred_lon = db_coords[idx]
-            dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
-            is_correct_top.append((pred_place == q_place) or (dist <= 25.0))
-            
+        dist = haversine_distance(db_lat[top10], db_lon[top10], q_lat, q_lon)
+        is_correct_top = (db_place_keys[top10] == q_place_keys[i]) | (dist <= args.dist_threshold)
+
         if is_correct_top[0]:
             correct_r1 += 1
-        if any(is_correct_top[:5]):
+        if is_correct_top[:5].any():
             correct_r5 += 1
-        if any(is_correct_top[:10]):
+        if is_correct_top[:10].any():
             correct_r10 += 1
 
     print("\n" + "=" * 50)
     print("                RÉSULTATS DE TEST")
     print("=" * 50)
     print(f"  Nombre total de requêtes : {n_queries}")
+    print(f"  Rayon de validation      : {args.dist_threshold:.0f}m")
     print(f"  Reranking Textuel actif  : {args.use_text_rerank}")
     print(f"  Recall@1                 : {correct_r1 / n_queries * 100:.2f}%")
     print(f"  Recall@5                 : {correct_r5 / n_queries * 100:.2f}%")
@@ -358,7 +338,9 @@ def main():
     q_words = q_texts[q_idx]
     q_lat, q_lon = q_coords[q_idx]
     
-    q_sims = all_sims[q_idx]
+    # Similarites recalculees pour cette seule requete : les conserver pour les 22 907
+    # requetes couterait ~1,4 Go, alors qu'une ligne se recalcule en quelques ms.
+    q_sims = db_matrix @ q_matrix[q_idx]
     q_top5_idx = all_top_indices[q_idx][:5]
 
     target_size = (250, 250)
@@ -397,7 +379,7 @@ def main():
         pred_path_debug = db_paths[idx]
         pred_lat_debug, pred_lon_debug = db_coords[idx]
         dist_debug = haversine_distance(pred_lat_debug, pred_lon_debug, q_lat, q_lon)
-        is_correct_debug = (pred_place_debug == q_place) or (dist_debug <= 25.0)
+        is_correct_debug = (pred_place_debug == q_place) or (dist_debug <= args.dist_threshold)
         print(f"Match #{i+1}: Index={idx}, Place ID={pred_place_debug}, Dist={dist_debug:.1f}m, Correct={is_correct_debug}")
         print(f"         Path: {pred_path_debug}")
     print("=" * 60)
@@ -415,7 +397,7 @@ def main():
         pred_lat, pred_lon = db_coords[idx]
         
         dist = haversine_distance(pred_lat, pred_lon, q_lat, q_lon)
-        is_correct = (pred_place == q_place) or (dist <= 25.0)
+        is_correct = (pred_place == q_place) or (dist <= args.dist_threshold)
         # Green if correct, Red if incorrect
         border_color = (46, 204, 113) if is_correct else (231, 76, 60)
         

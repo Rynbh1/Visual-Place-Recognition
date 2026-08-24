@@ -1,7 +1,14 @@
 venv/
 build dataset/secrets_local.py
-datasets/
+build dataset/to_png.py
+build dataset/extract_zip.py
+build dataset/paris_lists
+build dataset/datasets/
+TextInPlace/repo
+TextInPlace/logs
+TextInPlace/weights
 __pycache__/
 *.pyc
 *.pth
 *.png
+.cache/

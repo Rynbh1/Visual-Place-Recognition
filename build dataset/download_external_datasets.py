@@ -15,7 +15,7 @@ Contraintes reelles (cf. recherche) :
     par RSYNC depuis un serveur PUBLIC (aucun token) :
     rsync://vandaldata.polito.it/sf_xl/<version>
 
-=== IDENTIFIANTS (dans secrets_local.py, git-ignore) ===
+=== IDENTIFIANTS (dans secrets_local.py) ===
   - KAGGLE_API_TOKEN : token Kaggle (nouveau format KGAT_...), pour GSV-Cities.
     Obtenir : https://www.kaggle.com/settings -> "Create New API Token".
   - SF-XL : aucun token (rsync public).
@@ -83,15 +83,32 @@ def osv_download_full(dest, workers):
 # --------------------------------------------------------------------------
 # MegaScenes (Paris + remplissage diversite selon l'espace disque)
 # --------------------------------------------------------------------------
-def ms_select_by_diversity(meta_dir, budget_bytes):
+def ms_select_by_diversity(meta_dir, budget_bytes, recompute=False):
     """Choisit les cles S3 a telecharger : TOUT Paris, puis un maximum de
     categories DISTINCTES (diversite) tant qu'on tient dans budget_bytes.
 
     Strategie : on couvre d'abord le plus de categories possibles (1 image
     chacune), puis on approfondit (plus d'images/categorie) si le budget reste.
+
+    La selection est mise en cache sur disque (selected_keys.json). Le budget
+    reel depend de l'espace disque LIBRE, qui diminue au fur et a mesure du
+    telechargement : sans cache, relancer le script apres une interruption
+    recalculerait un budget plus petit et choisirait un sous-ensemble DIFFERENT
+    (donc pas une vraie reprise). Avec le cache, la liste cible est figee des
+    le premier run ; les fichiers deja presents sont simplement sautes par
+    `_ms_download_one`, ce qui donne une reprise fiable. Utiliser
+    `recompute=True` pour forcer un nouveau calcul (efface le cache).
     """
     import json
     import pyarrow.parquet as pq
+
+    cache_path = meta_dir / "selected_keys.json"
+    if cache_path.exists() and not recompute:
+        selected = json.loads(cache_path.read_text(encoding="utf-8"))
+        print(f"  MegaScenes : reprise depuis la selection en cache "
+              f"({len(selected)} images, ~{gb(len(selected) * MS_AVG_BYTES):.1f} Go) "
+              f"-> {cache_path}")
+        return selected
 
     # categories.json (cat -> scene id) ; deja telecharge si cache Paris construit
     cats_path = meta_dir / "categories.json"
@@ -115,7 +132,7 @@ def ms_select_by_diversity(meta_dir, budget_bytes):
                 by_cat.setdefault(c, []).append(im)
 
     def full_key(cat, im):
-        return f"{paris._ms_scene_path(cat2sid[cat])}/{im}".replace(" ", "_")
+        return f"{paris._ms_scene_path(cat2sid[cat])}/{im}"
 
     paris_cats = [c for c in by_cat if paris._is_paris_cat(c, paris_keywords)]
     other_cats = sorted(c for c in by_cat if c not in set(paris_cats))
@@ -166,19 +183,35 @@ def ms_select_by_diversity(meta_dir, budget_bytes):
     print(f"  MegaScenes : {len(selected)} images selectionnees "
           f"(~{gb(len(selected) * MS_AVG_BYTES):.1f} Go), "
           f"{n_cats_covered} categories distinctes")
+    cache_path.write_text(json.dumps(selected), encoding="utf-8")
     return selected
 
 
 def ms_download_selection(keys, out_dir, workers):
     out_dir.mkdir(parents=True, exist_ok=True)
+    import os
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tqdm import tqdm
+    already = sum(1 for k in keys if (out_dir / k).exists() and (out_dir / k).stat().st_size > 0)
+    if already:
+        print(f"  MegaScenes : {already}/{len(keys)} images deja presentes, reprise du telechargement...")
     total = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futs = [pool.submit(paris._ms_download_one, k, out_dir) for k in keys]
         for f in tqdm(as_completed(futs), total=len(futs), desc="  MegaScenes"):
             total += f.result()
-    print(f"  MegaScenes : {total} images -> {out_dir}")
+        pool.shutdown(wait=True)
+    except KeyboardInterrupt:
+        # Ne PAS attendre les threads en cours (bloques jusqu'a 120s sur leur
+        # requete HTTP) : les telechargements deja passes en .tmp -> rename
+        # sont surs a interrompre, donc on sort immediatement (os._exit
+        # court-circuite le join des threads fait par l'atexit de CPython).
+        print(f"\n  MegaScenes : interrompu ({total} nouvelles images telechargees). "
+              f"Relance le script pour reprendre.")
+        pool.shutdown(wait=False, cancel_futures=True)
+        os._exit(130)
+    print(f"  MegaScenes : {total} nouvelles images -> {out_dir}")
 
 
 # --------------------------------------------------------------------------
@@ -313,15 +346,18 @@ def print_estimates(args, dest, enabled):
 
 def main():
     ap = argparse.ArgumentParser(description="Telecharge les datasets VPR (estimation + download).")
-    ap.add_argument("--download", default="",
-                    help="Datasets a telecharger : osv,megascenes,gsv,sfxl (vide = estimation seule)")
-    ap.add_argument("--dest", type=Path, default=SCRIPT_DIR / "datasets")
+    ap.add_argument("--download", default="megascenes",
+                    help="Datasets a telecharger : osv,megascenes,gsv,sfxl,msls (defaut: megascenes seul)")
+    ap.add_argument("--dest", type=Path, default="/media/rayan/usb1")
     ap.add_argument("--extern-disk", default=None,
                     help="Chemin d'un disque externe (cible + budget de MegaScenes)")
     ap.add_argument("--size", type=float, default=None,
                     help="Taille totale cible pour le telechargement en Go (ajuste MegaScenes)")
     ap.add_argument("--megascenes-budget-gb", type=float, default=None,
                     help="Force le budget MegaScenes (Go) au lieu de l'auto-detection")
+    ap.add_argument("--recompute-selection", action="store_true",
+                    help="Ignore le cache de selection MegaScenes et la recalcule "
+                         "(sinon reprise automatique depuis selected_keys.json)")
     ap.add_argument("--sfxl-version", choices=["small", "processed", "raw"], default="small")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--yes", action="store_true")
@@ -353,7 +389,7 @@ def main():
     if "megascenes" in enabled:
         meta_dir = SCRIPT_DIR / "datasets" / "paris_external" / "_metadata"
         budget = compute_ms_budget(args, dest, enabled)
-        keys = ms_select_by_diversity(meta_dir, budget)
+        keys = ms_select_by_diversity(meta_dir, budget, recompute=args.recompute_selection)
         ms_target = (Path(args.extern_disk) if args.extern_disk else dest) / "megascenes"
         ms_download_selection(keys, ms_target, args.workers)
     if "gsv" in enabled:
